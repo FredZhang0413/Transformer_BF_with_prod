@@ -11,7 +11,7 @@ import matplotlib.pyplot as plt
 def train_curriculum_learning(policy_net_mimo, optimizer, device, K, N, P, num_epochs, num_epochs_per_subspace, episode_length, batch_size, noise_power=1, reward_change=0):
     env_mimo = MIMOEnv(K=K, N=N, P=P, noise_power=noise_power, device=device, num_env=batch_size, episode_length=episode_length)
     pbar = tqdm(range(num_epochs))
-    sum_rate = th.zeros(100, env_mimo.episode_length, 3)
+    sum_rate = th.zeros(500, env_mimo.episode_length, 3)
     test_P = [10 ** 1, 10 ** 1.5, 10 ** 2]
       
     # env_mimo.reset()
@@ -60,7 +60,7 @@ def train_curriculum_learning(policy_net_mimo, optimizer, device, K, N, P, num_e
         # if (epoch+1) % num_epochs_to_save_model == 0:
         #     th.save(policy_net_mimo.state_dict(), save_path + f"{epoch}.pth")
         if (epoch + 1) % num_epochs_per_subspace == 0 and env_mimo.subspace_dim <= 2 * K * N:
-            env_mimo.subspace_dim += 2
+            env_mimo.subspace_dim += 4
         if (epoch) % 50 == 0:
             sum_rate_mmse_group = th.zeros(3)
             with th.no_grad():
@@ -101,16 +101,16 @@ def get_cwd(env_name):
     return f"./{env_name}/{max_exp_id}/"
 
 if __name__  == "__main__":
-    N = 4  # number of antennas
-    K = 4   # number of users
+    N = 16  # number of antennas
+    K = 16   # number of users
     SNR = 15
     P = 10 ** (SNR / 10)
-    num_epochs = 20000
-    num_epochs_per_subspace = 1000
+    num_epochs = 100000
+    num_epochs_per_subspace = 500
     episode_length = 5
-    batch_size = 4096
+    batch_size = 1024
     noise_power = 1
-    mid_dim = 256
+    mid_dim = 512
     learning_rate = 5e-5
     cwd = f"RANDOM_H_CL_REINFORCE_N{N}K{K}SNR{SNR}"
     config = {

@@ -11,12 +11,12 @@ class MIMOEnv():
         self.device = device
         ### basis vectors for subspace curriculum learning
         self.basis_vectors, _ = th.linalg.qr(th.rand(2 * self.K * self.N, 2 * self.K * self.N, dtype=th.float, device=self.device))
-        self.subspace_dim = 2
+        self.subspace_dim = 4
         # self.subspace_dim = 2 * self.K * self.N
         self.num_env = num_env
         self.episode_length = episode_length
         # with open("./K8N8Samples=100.pkl", 'rb') as f:
-        self.test_H = th.randn(100, self.K, self.N, dtype=th.cfloat, device=self.device)
+        self.test_H = th.randn(500, self.K, self.N, dtype=th.cfloat, device=self.device)
 
     def reset(self, test=False, test_P = None): ### default training state: hybrid P, subspace dim
         # self.test = False
