@@ -321,7 +321,7 @@ class ChannelDataset(Dataset):
         H_imag = th.randn(self.num_users, self.num_tx) * scale
         H_combined = th.stack([H_real, H_imag], dim=0)  # Shape: (2, num_users, num_tx)
         H_combined = H_combined * (self.P ** 0.5)
-        return H_combined
+        return th.tensor(H_combined)
 
 #############################################
 # 5. Optimizer configuration

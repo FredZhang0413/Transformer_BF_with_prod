@@ -329,13 +329,12 @@ class ChannelDataset(Dataset):
         # H_combined = np.stack([H_real, H_imag], axis=0)*((self.P)**0.5)  ### Shape: (2, num_users, num_tx)   
 
         #### another way to generate the channel
-        H_gen = th.randn(self.num_users, self.num_tx, dtype=th.cfloat) 
-        H_real = H_gen.real
-        H_imag = H_gen.imag
-        H_combined = th.stack([H_real, H_imag], dim=0)  ### Shape: (2, num_users, num_tx)
-        H_combined = H_combined * ((self.P)**0.5)  ### Shape: (2, num_users, num_tx)
- 
-        return H_combined ### transform to tensor
+        scale = math.sqrt(2) / 2
+        H_real = th.randn(self.num_users, self.num_tx) * scale
+        H_imag = th.randn(self.num_users, self.num_tx) * scale
+        H_combined = th.stack([H_real, H_imag], dim=0)  # Shape: (2, num_users, num_tx)
+        H_combined = H_combined * (self.P ** 0.5)
+        return th.tensor(H_combined)
 
 
 #############################################
@@ -413,6 +412,8 @@ def train_beamforming_transformer(config):
     teacher_weight = 0
 
     rate_history = []
+    test_rate_history = []
+    ave_rate_history = []
     
     for epoch in range(config.max_epoch):
 
@@ -500,20 +501,34 @@ def train_beamforming_transformer(config):
         
         # Optionally, print out the current learning rate for debugging
         current_lr = optimizer.param_groups[0]['lr']
-        print(f"Epoch {epoch+1} completed. Learning Rate: {current_lr:.2e}")
-        print(f"Epoch {epoch+1} Average Sum Rate: {epoch_rate/pbar_batches:.4f}")
+        ave_pbar_rate = epoch_rate / pbar_batches
+        test_pbar_rate = max_rate
+        ave_rate_history.append(th.tensor(ave_pbar_rate))
+        test_rate_history.append(th.tensor(test_pbar_rate))
+        # print(f"Epoch {epoch+1} completed. Learning Rate: {current_lr:.2e}")
+        print(f"Epoch {epoch+1} Average Sum Rate: {ave_pbar_rate:.4f}")
         # print(f"Epoch {epoch+1} Average Loss: {epoch_loss/pbar_batches:.4f}, Average Sum Rate: {epoch_rate/pbar_batches:.4f}")
 
     rate_history = th.stack(rate_history)
-    th.save(rate_history, "train_rate_history_record.pth")
-    rate_history = th.load("train_rate_history_record.pth")
-    rate_show_gap = 5000
-    # x_rate_history = th.arange(0, len(rate_history), rate_show_gap)
+    ave_rate_history = th.stack(ave_rate_history)
+    test_rate_history = th.stack(test_rate_history)
+    th.save(rate_history, f"rate_train_history_{config.num_users}_{config.num_tx}_no_prod.pth")
+    rate_history = th.load(f"rate_train_history_{config.num_users}_{config.num_tx}_no_prod.pth")
+    th.save(ave_rate_history, f"rate_ave_history_{config.num_users}_{config.num_tx}_no_prod.pth")
+    ave_rate_history = th.load(f"rate_ave_history_{config.num_users}_{config.num_tx}_no_prod.pth")
+    th.save(test_rate_history, f"rate_test_history_{config.num_users}_{config.num_tx}_no_prod.pth")
+    test_rate_history = th.load(f"rate_test_history_{config.num_users}_{config.num_tx}_no_prod.pth")
+
+    # Create x-axis values for both plots
     x_rate_history = th.arange(len(rate_history))
-    # rate_history = rate_history[x_rate_history]
+    x_test_rate_history = th.arange(len(test_rate_history)) * config.pbar_size  # Scale by pbar_size
+
     plt.figure(figsize=(10, 6))
-    plt.plot(x_rate_history, rate_history, marker='o', linestyle='-', color='b')
-    plt.title("Training Rate History")
+    plt.plot(x_rate_history, rate_history, marker='.', linestyle='-', color='b', label='Training Rate')
+    plt.plot(x_test_rate_history, ave_rate_history, marker='*', linestyle='-', color='g', label='Average Rate')
+    plt.plot(x_test_rate_history, test_rate_history, marker='o', linestyle='-', color='r', label='Testing Rate')
+    plt.title(f"Training and Testing Rate without prod when N={config.num_tx} and K={config.num_users}")
+    plt.legend()
     plt.xlabel("Epochs")
     plt.ylabel("Sum Rate")
     plt.grid(True, which="both", ls="--")
@@ -580,7 +595,7 @@ if __name__ == "__main__":
     batch_size = 256 
     learning_rate = 1e-4
     weight_decay = 0.1
-    max_epoch = 10
+    max_epoch = 200
     sigma2 = 1.0  
     SNR = 15
     SNR_power = 10 ** (SNR/10) # SNR power in dB
@@ -590,7 +605,7 @@ if __name__ == "__main__":
     resid_pdrop = 0.0
     mlp_ratio = 4
     subspace_dim = 4
-    pbar_size = 10000
+    pbar_size = 2000
     
     # Create config object with parameters
     config = BeamformerTransformerConfig(
