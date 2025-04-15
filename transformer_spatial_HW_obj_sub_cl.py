@@ -1,3 +1,4 @@
+
 import math
 import torch as th
 import torch.nn as nn
@@ -15,7 +16,9 @@ warnings.filterwarnings("ignore")
 
 mse_loss_fn = nn.MSELoss()
 
+
 ## wmmse: 52.07755418089099；ZF: 43.94968651013214 (16*16 Gaussian channel)
+## wmmse: 27.24612893140909；ZF: 21.29116212713009 (8*8 Gaussian channel)
 ## wmmse: 14.27623317904294；ZF: 12.13094550542433 (4*4 Gaussian channel)
 
 ##### 1. already tried
@@ -46,11 +49,11 @@ mse_loss_fn = nn.MSELoss()
 ### focus on the problem: the gradient is too sparse
 
 
-
 ###### 3. seems infeasible
 ### consider noise injection
 ### consider the learning rate warm-up at the early stage
 ### consider random initialization of the beamformer
+
 
 
 #############################################
@@ -61,13 +64,12 @@ def sum_rate(H, W, sigma2=1.0):
     signal_power = th.abs(th.diagonal(prod, dim1=-2, dim2=-1))**2
     interference = th.sum(th.abs(prod)**2, dim=-1) - signal_power
     N = sigma2
-    SINR = signal_power / (interference + N) # (B, num_users)
+    SINR = signal_power / (interference + N)  # (B, num_users)
     reward = th.log2(1 + SINR).sum(dim=-1).mean()
     return reward
 
-
 #############################################
-# Cross-Attention Block (for both Antenna-level and User-level)
+# Modified Cross-Attention Block supporting separate Query, Key, and Value.
 #############################################
 class CrossAttentionBlock(nn.Module):
     def __init__(self, d_model, n_head, attn_pdrop, resid_pdrop):
@@ -76,7 +78,7 @@ class CrossAttentionBlock(nn.Module):
         self.n_head = n_head
         self.head_dim = d_model // n_head
         
-        # Linear projections for Query, Key, and Value
+        # Linear projections for Query, Key, and Value.
         self.q_proj = nn.Linear(d_model, d_model)
         self.k_proj = nn.Linear(d_model, d_model)
         self.v_proj = nn.Linear(d_model, d_model)
@@ -84,80 +86,63 @@ class CrossAttentionBlock(nn.Module):
         self.resid_drop = nn.Dropout(resid_pdrop)
         self.proj = nn.Linear(d_model, d_model)
         
-        # LayerNorm and MLP sublayer (similar to standard Transformer blocks)
+        # LayerNorm for each sublayer.
         self.ln1 = nn.LayerNorm(d_model)
         self.ln2 = nn.LayerNorm(d_model)
-        # ### scheme 1
-        # self.mlp = nn.Sequential(
-        #     nn.Linear(d_model, 4 * d_model),
-        #     nn.GELU(),
-        #     nn.Linear(4 * d_model, d_model),
-        #     nn.Dropout(resid_pdrop),
-        # )
-        ### scheme 2 (better)
+        # MLP block with an extra layer (scheme 2).
         self.mlp = nn.Sequential(
             nn.Linear(d_model, 4 * d_model),
             nn.GELU(),
             nn.Dropout(resid_pdrop),
-            nn.Linear(4 * d_model, 4 * d_model),  # Additional layer
+            nn.Linear(4 * d_model, 4 * d_model),  # additional layer
             nn.GELU(),
             nn.Dropout(resid_pdrop),
             nn.Linear(4 * d_model, d_model),
             nn.Dropout(resid_pdrop),
         )
-        # ### scheme 3 (bad, should not add LayerNorm here)
-        # self.mlp = nn.Sequential(
-        #     nn.Linear(d_model, 4 * d_model),
-        #     nn.LayerNorm(4 * d_model),
-        #     nn.GELU(),
-        #     nn.Dropout(resid_pdrop),
-        #     nn.Linear(4 * d_model, 4 * d_model),  # Additional layer
-        #     nn.LayerNorm(4 * d_model),
-        #     nn.GELU(),
-        #     nn.Dropout(resid_pdrop),
-        #     nn.Linear(4 * d_model, d_model),
-        #     nn.Dropout(resid_pdrop),
-        # )
     
-    def forward(self, query, kv):
+    def forward(self, query, key, value):
         """
+        Performs cross-attention using separate Query, Key, and Value inputs.
+        
         Args:
-            query: Query token sequence, shape (B, L_q, d_model)
-            kv: Key and Value token sequence, shape (B, L_k, d_model)
+            query: Query tokens, shape (B, L_q, d_model).
+            key:   Key tokens, shape (B, L_k, d_model).
+            value: Value tokens, shape (B, L_v, d_model); L_k == L_v is assumed.
         Returns:
-            Output with shape (B, L_q, d_model)
+            Output with shape (B, L_q, d_model).
         """
         B, L_q, _ = query.size()
-        B, L_k, _ = kv.size()
-
-        # Pre-norm on the inputs for residual connection
-        query_ln = self.ln1(query)
-        kv_ln = self.ln1(kv)
+        B, L_k, _ = key.size()
         
-        # Compute Q, K, V and reshape into multi-head format
-        Q = self.q_proj(query_ln).view(B, L_q, self.n_head, self.head_dim).transpose(1, 2)  # (B, n_head, L_q, head_dim)
-        K = self.k_proj(kv_ln).view(B, L_k, self.n_head, self.head_dim).transpose(1, 2)       # (B, n_head, L_k, head_dim)
-        V = self.v_proj(kv_ln).view(B, L_k, self.n_head, self.head_dim).transpose(1, 2)       # (B, n_head, L_k, head_dim)
+        # Apply LayerNorm separately.
+        q_ln = self.ln1(query)
+        k_ln = self.ln1(key)
+        v_ln = self.ln1(value)
         
-        # Compute attention scores (scaled dot-product attention)
+        # Compute Q, K, V and reshape for multi-head attention.
+        Q = self.q_proj(q_ln).view(B, L_q, self.n_head, self.head_dim).transpose(1, 2)  # (B, n_head, L_q, head_dim)
+        K = self.k_proj(k_ln).view(B, L_k, self.n_head, self.head_dim).transpose(1, 2)  # (B, n_head, L_k, head_dim)
+        V = self.v_proj(v_ln).view(B, L_k, self.n_head, self.head_dim).transpose(1, 2)  # (B, n_head, L_k, head_dim)
+        
+        # Scaled dot-product attention.
         att = (Q @ K.transpose(-2, -1)) / math.sqrt(self.head_dim)  # (B, n_head, L_q, L_k)
         att = F.softmax(att, dim=-1)
         att = self.attn_drop(att)
         
-        # Compute weighted sum of V
+        # Compute weighted sum of values.
         y = att @ V  # (B, n_head, L_q, head_dim)
         y = y.transpose(1, 2).contiguous().view(B, L_q, self.n_head * self.head_dim)  # (B, L_q, d_model)
         y = self.proj(y)
         y = self.resid_drop(y)
         
-        # Residual connection: add the attention output to the original query
+        # Residual connection and MLP.
         out = query + y
-        # Further process with an MLP (with its own residual connection)
         out = out + self.mlp(self.ln2(out))
         return out
 
 #############################################
-# Beamforming Transformer (Modified for Complex Inputs)
+# Modified Beamforming Transformer for Complex Inputs with updated V computations.
 #############################################
 class BeamformingTransformer(nn.Module):
     def __init__(self, config):
@@ -167,37 +152,39 @@ class BeamformingTransformer(nn.Module):
         self.K = config.num_users   # Number of users
         self.N = config.num_tx      # Number of transmit antennas
         
-        # Define projection layers for tokens to map to d_model dimensions.
-        # For antenna-level tokens: each token has dimension K (from one column) before splitting,
-        # but after splitting real/imaginary, each token is still of length K.
-        self.antenna_channel_proj = nn.Linear(self.K, config.d_model)
-        self.antenna_beam_proj    = nn.Linear(self.K, config.d_model)
-        # For user-level tokens: each token has dimension N (from one row)
-        self.user_channel_proj = nn.Linear(self.N, config.d_model)
-        self.user_beam_proj    = nn.Linear(self.N, config.d_model)
+        # Projection layers for tokens.
+        # For antenna-level tokens: each token originally has dimension K.
+        self.antenna_channel_proj = nn.Linear(self.K, config.d_model)  # For Query tokens
+        self.antenna_beam_proj    = nn.Linear(self.K, config.d_model)  # For Key tokens
         
-        # Define positional embeddings for antenna-level and user-level tokens.
-        # For antenna-level, there are now 2*N tokens (real and imaginary parts for each column).
+        # For user-level tokens: each token originally has dimension N.
+        self.user_channel_proj = nn.Linear(self.N, config.d_model)      # For Query tokens
+        self.user_beam_proj    = nn.Linear(self.N, config.d_model)      # For Key tokens
+        
+        # New projection layers for value tokens derived from the product.
+        self.antenna_prod_proj = nn.Linear(self.K, config.d_model)       # For antenna-level V tokens
+        self.user_prod_proj    = nn.Linear(self.K, config.d_model)       # For user-level V tokens
+        
+        # Positional embeddings.
+        # For antenna-level, tokens from columns (real and imaginary parts).
         self.pos_emb_ant = nn.Parameter(th.zeros(2 * self.N, config.d_model))
-        # For user-level, there are 2*K tokens.
+        # For user-level, tokens from rows (real and imaginary parts).
         self.pos_emb_user = nn.Parameter(th.zeros(2 * self.K, config.d_model))
         
-        # Define cross-attention blocks for antenna-level and user-level
+        # Cross-Attention blocks.
         self.cross_attn_ant = CrossAttentionBlock(d_model=config.d_model, n_head=config.n_head, 
                                                     attn_pdrop=config.attn_pdrop, resid_pdrop=config.resid_pdrop)
         self.cross_attn_user = CrossAttentionBlock(d_model=config.d_model, n_head=config.n_head, 
                                                      attn_pdrop=config.attn_pdrop, resid_pdrop=config.resid_pdrop)
         
-        # Define final fusion and output projection MLP.
-        # We flatten the antenna-level (2*N tokens) and user-level (2*K tokens) features and then concatenate.
-        # The final output dimension is beam_dim (typically 2 * num_tx * num_users).
+        # Final fusion and output projection MLP.
         self.out_proj = nn.Sequential(
             nn.Linear((2 * self.N + 2 * self.K) * config.d_model, config.d_model),
-            nn.ReLU(),  # Alternatively, you may try LeakyReLU here if needed.
+            nn.ReLU(),  
             nn.Linear(config.d_model, config.beam_dim)
         )
         
-        # Weight initialization
+        # Weight initialization.
         self.apply(self._init_weights)
         print(f"Number of parameters: {sum(p.numel() for p in self.parameters()):,}")
     
@@ -219,8 +206,8 @@ class BeamformingTransformer(nn.Module):
     def forward(self, H, W_prev):
         """
         Args:
-            H: Constant channel matrix, shape (B, num_users, num_tx) i.e. (B, K, N), complex-valued.
-            W_prev: Previous beamformer, shape (B, num_users, num_tx) i.e. (B, K, N), complex-valued.
+            H: Complex channel matrix, shape (B, num_users, num_tx) (i.e. (B, K, N)).
+            W_prev: Previous beamformer, shape (B, num_users, num_tx) (i.e. (B, K, N)), complex.
         Returns:
             W_next: Vectorized predicted beamformer, shape (B, beam_dim)
         """
@@ -229,66 +216,85 @@ class BeamformingTransformer(nn.Module):
         N = self.N  # Number of transmit antennas
         
         # ---------------------------
-        # 1. Antenna-level Cross-Attention
+        # Compute the product: Prod = H * (W_prev^T).
+        # H and W_prev are complex with shape (B, K, N); W_prev^T has shape (B, N, K), so Prod is (B, K, K).
         # ---------------------------
-        # For antenna-level, tokens are constructed from the columns of H.
-        # Each column (of shape (B, K)) is split into its real and imaginary parts.
-        # This creates 2*N tokens of shape (B, K) each.
-        H_ant = th.cat([H.real.transpose(1,2), H.imag.transpose(1,2)], dim=1)   # (B, 2*N, K)
+        Prod = th.bmm(H, W_prev.transpose(-1, -2))  # (B, K, K)
+        
+        # ---------------------------
+        # 1. Antenna-level Cross-Attention
+        #    - Query tokens from H (column-wise tokens).
+        #    - Key tokens from W_prev (column-wise tokens).
+        #    - Value tokens from Prod are obtained column-wise.
+        # ---------------------------
+        # Create antenna-level tokens.
+        H_ant = th.cat([H.real.transpose(1,2), H.imag.transpose(1,2)], dim=1)    # (B, 2*N, K)
         W_ant = th.cat([W_prev.real.transpose(1,2), W_prev.imag.transpose(1,2)], dim=1)  # (B, 2*N, K)
         
-        # Project tokens to d_model space
+        # Project Query and Key tokens.
         H_ant_proj = self.antenna_channel_proj(H_ant)  # (B, 2*N, d_model)
         W_ant_proj = self.antenna_beam_proj(W_ant)       # (B, 2*N, d_model)
         
-        # Add antenna-level positional embeddings (each token is indexed 0 ... 2*N-1)
-        H_ant_proj = H_ant_proj + self.pos_emb_ant.unsqueeze(0)  # (B, 2*N, d_model)
-        W_ant_proj = W_ant_proj + self.pos_emb_ant.unsqueeze(0)  # (B, 2*N, d_model)
+        # Create Value tokens:
+        # Each column of Prod is used as an antenna-level token.
+        V_ant = th.cat([Prod.real.transpose(1,2), Prod.imag.transpose(1,2)], dim=1)  # (B, 2*K, K)
+        # Project V_ant to the desired dimension.
+        V_ant_proj = self.antenna_prod_proj(V_ant)  # (B, 2*K, d_model)
+        # Add positional embedding to Value tokens (antenna-level).
+        V_ant_proj = V_ant_proj + self.pos_emb_ant.unsqueeze(0)
         
-        # Apply cross-attention: use H_ant_proj as Query, W_ant_proj as Key and Value
-        x_a = self.cross_attn_ant(H_ant_proj, W_ant_proj)  # (B, 2*N, d_model)
+        # Add positional embeddings to Query and Key tokens.
+        H_ant_proj = H_ant_proj + self.pos_emb_ant.unsqueeze(0)
+        W_ant_proj = W_ant_proj + self.pos_emb_ant.unsqueeze(0)
+        
+        # Cross-attention for antenna-level.
+        x_a = self.cross_attn_ant(H_ant_proj, W_ant_proj, V_ant_proj)  # (B, 2*N, d_model)
         
         # ---------------------------
         # 2. User-level Cross-Attention
+        #    - Query tokens from H (row-wise tokens).
+        #    - Key tokens from W_prev (row-wise tokens).
+        #    - Value tokens from Prod are obtained row-wise.
         # ---------------------------
-        # For user-level, tokens are constructed from the rows of H.
-        # Each row (of shape (B, N)) is split into its real and imaginary parts,
-        # resulting in 2*K tokens of shape (B, N) each.
         H_user = th.cat([H.real, H.imag], dim=1)  # (B, 2*K, N)
         W_user = th.cat([W_prev.real, W_prev.imag], dim=1)  # (B, 2*K, N)
         
-        # Project tokens to d_model space
+        # Project Query and Key tokens.
         H_user_proj = self.user_channel_proj(H_user)  # (B, 2*K, d_model)
         W_user_proj = self.user_beam_proj(W_user)       # (B, 2*K, d_model)
         
-        # Add user-level positional embeddings (each token is indexed 0 ... 2*K-1)
-        H_user_proj = H_user_proj + self.pos_emb_user.unsqueeze(0)  # (B, 2*K, d_model)
-        W_user_proj = W_user_proj + self.pos_emb_user.unsqueeze(0)  # (B, 2*K, d_model)
+        # Create Value tokens:
+        # Each row of Prod is used as a user-level token.
+        V_user = th.cat([Prod.real, Prod.imag], dim=1)  # (B, 2*K, K)
+        # Project V_user to the desired dimension.
+        V_user_proj = self.user_prod_proj(V_user)  # (B, 2*K, d_model)
+        # Add positional embedding to Value tokens (user-level).
+        V_user_proj = V_user_proj + self.pos_emb_user.unsqueeze(0)
         
-        # Apply cross-attention: use H_user_proj as Query, W_user_proj as Key and Value
-        x_u = self.cross_attn_user(H_user_proj, W_user_proj)  # (B, 2*K, d_model)
+        # Add positional embeddings to Query and Key tokens.
+        H_user_proj = H_user_proj + self.pos_emb_user.unsqueeze(0)
+        W_user_proj = W_user_proj + self.pos_emb_user.unsqueeze(0)
+        
+        # Cross-attention for user-level.
+        x_u = self.cross_attn_user(H_user_proj, W_user_proj, V_user_proj)  # (B, 2*K, d_model)
         
         # ---------------------------
         # 3. Fusion and Output Prediction
         # ---------------------------
-        # Flatten the antenna-level and user-level outputs and concatenate them
-        x_a_flat = x_a.view(B, -1)  # (B, (2*N) * d_model)
-        x_u_flat = x_u.view(B, -1)  # (B, (2*K) * d_model)
-        x_fused = th.cat([x_a_flat, x_u_flat], dim=-1)  # (B, (2*N+2*K) * d_model)
+        # Flatten the outputs and concatenate.
+        x_a_flat = x_a.view(B, -1)      # (B, (2*N)*d_model)
+        x_u_flat = x_u.view(B, -1)      # (B, (2*K)*d_model)
+        x_fused = th.cat([x_a_flat, x_u_flat], dim=-1)  # (B, (2*N+2*K)*d_model)
         
-        # Project the fused features to the final beamformer vector (beam_dim = 2 * num_tx * num_users)
+        # Project fused features to final beamformer vector and normalize.
         W_next = self.out_proj(x_fused)  # (B, beam_dim)
-        # Normalize the predicted beamformer
         norm = th.norm(W_next, dim=1, keepdim=True)
         W_next = W_next / norm
         return W_next
 
-    
-
 #############################################
 # 5. Channel dataset: random Gaussian H
 #############################################
-# basis_vectors, _ = th.linalg.qr(th.rand(2 * 16 * 16, 2 * 16 * 16, dtype=th.float))
 def generate_basis_vectors(num_users, num_tx):
     vector_dim = 2 * num_users * num_tx  # Real + imaginary components
     basis_vectors, _ = th.linalg.qr(th.rand(vector_dim, vector_dim, dtype=th.float))
@@ -306,71 +312,46 @@ class ChannelDataset(Dataset):
     def __len__(self):
         return self.num_samples
     
-    #### generate a batch of channels based on a certain subspace dimension
-    
     def __getitem__(self, idx):
-        # coordinates = th.randn(self.subspace_dim, 1)
-        # basis_vectors_subset = self.basis_vectors[:self.subspace_dim].T
-        # vec_channel = th.matmul(basis_vectors_subset, coordinates).reshape(2 * self.num_users * self.num_tx)
-        # H_real = vec_channel[:self.num_tx * self.num_users].reshape(self.num_users, self.num_tx) ### (num_users, num_tx)
-        # H_imag = vec_channel[self.num_tx * self.num_users:].reshape(self.num_users, self.num_tx) ### (num_users, num_tx)
-        # H_complex = H_real + 1j * H_imag
-        # norm_H_complex = th.sum(th.abs(H_complex)**2)
-        # SNR_power = self.num_users*self.num_tx*self.P
-        # H_real = H_real * th.sqrt(SNR_power / norm_H_complex) ### (num_users, num_tx)
-        # H_imag = H_imag * th.sqrt(SNR_power / norm_H_complex) ### (num_users, num_tx)
-        # H_combined = th.stack([H_real, H_imag], dim=0) ### Shape: (2, num_users, num_tx)
-        # # H_combined = (vec_channel[:,:self.num_tx * self.num_users].reshape(-1, self.num_users, self.num_tx) + 1j * vec_channel[:,self.num_tx * self.num_users:].reshape(-1, self.num_users, self.num_tx)) ### (num_samples, num_users, num_tx)
+        coordinates = th.randn(self.subspace_dim, 1)
+        basis_vectors_subset = self.basis_vectors[:self.subspace_dim].T
+        vec_channel = th.matmul(basis_vectors_subset, coordinates).reshape(2 * self.num_users * self.num_tx)
+        H_real = vec_channel[:self.num_tx * self.num_users].reshape(self.num_users, self.num_tx) ### (num_users, num_tx)
+        H_imag = vec_channel[self.num_tx * self.num_users:].reshape(self.num_users, self.num_tx) ### (num_users, num_tx)
+        H_complex = H_real + 1j * H_imag
+        norm_H_complex = th.sum(th.abs(H_complex)**2)
+        SNR_power = self.num_users*self.num_tx*self.P
+        H_real = H_real * th.sqrt((SNR_power*0.5) / norm_H_complex) ### (num_users, num_tx)
+        H_imag = H_imag * th.sqrt((SNR_power*0.5) / norm_H_complex) ### (num_users, num_tx)
+        H_combined = th.stack([H_real, H_imag], dim=0) ### Shape: (2, num_users, num_tx)
 
-        # Generate complex channel matrix (real + imaginary parts)
-        # H_real = np.random.randn(self.num_users, self.num_tx).astype(np.float32)
-        # H_imag = np.random.randn(self.num_users, self.num_tx).astype(np.float32)
-        # # Stack real and imaginary parts
-        # H_combined = np.stack([H_real, H_imag], axis=0)*((self.P)**0.5)  ### Shape: (2, num_users, num_tx)   
+        # scale = math.sqrt(2) / 2
+        # H_real = th.randn(self.num_users, self.num_tx) * scale
+        # H_imag = th.randn(self.num_users, self.num_tx) * scale
+        # H_combined = th.stack([H_real, H_imag], dim=0)  # Shape: (2, num_users, num_tx)
+        # H_combined = H_combined * (self.P ** 0.5)
 
-        #### another way to generate the channel
-        scale = math.sqrt(2) / 2
-        H_real = th.randn(self.num_users, self.num_tx) * scale
-        H_imag = th.randn(self.num_users, self.num_tx) * scale
-        H_combined = th.stack([H_real, H_imag], dim=0)  # Shape: (2, num_users, num_tx)
-        H_combined = H_combined * (self.P ** 0.5)
         return th.tensor(H_combined)
-
 
 #############################################
 # 5. Optimizer configuration
 #############################################
 def configure_optimizer(model, learning_rate, weight_decay):
     """
-    Configure optimizer with selective weight decay - only for linear and Conv2d layers.
-        
-    Returns:
-        Configured AdamW optimizer
+    Configure optimizer with selective weight decay for linear and conv2d layers.
     """
-    # Separate parameters into those that should have weight decay and those that shouldn't
     decay_params = []
     no_decay_params = []
     
     for name, param in model.named_parameters():
-        # Check if parameter requires grad first to avoid unnecessary computation
         if not param.requires_grad:
             continue
-            
-        # Apply weight decay to linear and conv2d layers only
         if any(layer_type in name for layer_type in ['linear', 'conv', 'fc', 'weight']):
-            # Ensure we don't include layer norm or embedding weights that happen to have 'weight' in name
-            if not any(exclude_type in name for exclude_type in ['ln', 'norm', 'layernorm', 'emb', 'embedding', 'bias']):
+            if not any(exclude in name for exclude in ['ln', 'norm', 'layernorm', 'emb', 'embedding', 'bias']):
                 decay_params.append(param)
                 continue
-                
-        # All other parameters get no weight decay
         no_decay_params.append(param)
     
-    # # Log parameter counts for debugging
-    # print(f"Parameters with weight decay: {len(decay_params)}")
-    # print(f"Parameters without weight decay: {len(no_decay_params)}")
-    
-    # Create parameter groups
     optimizer_grouped_parameters = [
         {'params': decay_params, 'weight_decay': weight_decay},
         {'params': no_decay_params, 'weight_decay': 0.0}
@@ -379,6 +360,12 @@ def configure_optimizer(model, learning_rate, weight_decay):
     optimizer = th.optim.AdamW(optimizer_grouped_parameters, lr=learning_rate)
     return optimizer
 
+def get_mmse_obj(H, W, sigma2=1.0):
+    prod = th.bmm(H, W)  # (B, num_users, num_users)
+    fro_norm = th.norm(prod, p='fro', dim=(1,2)) ** 2
+    trace_real = th.stack([th.trace(prod).real for prod in prod])
+    MSE_obj = fro_norm - trace_real
+    return MSE_obj
 
 #############################################
 # 6. Training Routine
@@ -386,8 +373,6 @@ def configure_optimizer(model, learning_rate, weight_decay):
 def train_beamforming_transformer(config):
     """
     Train the beamforming transformer based on the given configuration.
-    Args:
-        config: An instance of BeamformerTransformerConfig with model and training parameters.
     """
     dataset = ChannelDataset(num_samples=config.pbar_size * config.batch_size,
                              num_users=config.num_users,
@@ -400,31 +385,43 @@ def train_beamforming_transformer(config):
     model = BeamformingTransformer(config).to(device)
     optimizer = configure_optimizer(model, config.learning_rate, config.weight_decay)
 
-    # Create the learning rate scheduler that linearly decays LR from 1e-4 to 1e-5 over max_epoch epochs
+    # Learning rate scheduler that linearly decays lr.
     scheduler = th.optim.lr_scheduler.LambdaLR(
-        optimizer, lambda epoch: 1 - 0.0 * (epoch / config.max_epoch)
+        optimizer, lambda epoch: 1 - 0.3 * (epoch / config.max_epoch)
     )
     
     global mmse_rate_printed
     mmse_rate_printed = False
     model.train()
-    # teacher_weight = 1
-    teacher_weight = 0
-
+    
     rate_history = []
     test_rate_history = []
     ave_rate_history = []
+
+    teacher_weight = 0  # 0 or 1 depending on epoch switching
+    initial_subspace_dim = config.ini_sub_dim
+    cl_increment = config.ini_sub_dim
+    current_subspace_dim = initial_subspace_dim
     
     for epoch in range(config.max_epoch):
 
-        # # smooth switching
-        # teacher_weight = max(teacher_weight - 0.02,0)
+        print(f"Current subspace dimension: {current_subspace_dim}")
 
-        ## hard switching (works better)
-        if epoch < 10:
+        if epoch % config.sub_dim_epoch == 0 and epoch > 0:
+            dim_increment = epoch // config.sub_dim_epoch
+            current_subspace_dim = min(initial_subspace_dim + dim_increment * cl_increment, 2*config.num_users * config.num_tx)
+
+        dataset = ChannelDataset(num_samples=config.pbar_size*config.batch_size, 
+                                 num_users=config.num_users, 
+                                 num_tx=config.num_tx, 
+                                 P=config.SNR_power, 
+                                 subspace_dim=current_subspace_dim)
+        dataloader = DataLoader(dataset, batch_size=config.batch_size, shuffle=True)
+
+        # Hard switch learning policy.
+        if epoch % config.sub_dim_epoch == 0:
             teacher_weight = 1
         else:
-            # teacher_weight = 0
             teacher_weight = 0.0
 
         epoch_loss = 0
@@ -436,21 +433,19 @@ def train_beamforming_transformer(config):
             # Channel input: shape (B, 2, num_users, num_tx)
             H_tensor = batch.to(device)
             batch_size = H_tensor.size(0)
-            # Convert H to complex format: (B, num_users, num_tx)
+            # Convert to complex channel matrix: (B, num_users, num_tx)
             H_mat = H_tensor[:, 0, :, :] + 1j * H_tensor[:, 1, :, :]
             
-            ## Compute initial beamformer using MMSE (for initialization)
-            W0, _ = compute_mmse_beamformer(H_mat, config.num_users, config.num_tx, config.SNR_power, config.sigma2, device)
-            W0 = W0.transpose(-1, -2).to(device) # (B, num_tx, num_users)
-            vec_w0 = th.cat((th.real(W0).reshape(-1, config.num_tx * config.num_users), th.imag(W0).reshape(-1, config.num_tx * config.num_users)), dim=-1)
+            # Compute initial beamformer using MMSE.
+            W0, _ = compute_mmse_beamformer(H_mat, config.num_users, config.num_tx, 
+                                            config.SNR_power, config.sigma2, device)
+            W0 = W0.transpose(-1, -2).to(device)  # (B, num_tx, num_users)
+            vec_w0 = th.cat((th.real(W0).reshape(-1, config.num_tx * config.num_users), 
+                             th.imag(W0).reshape(-1, config.num_tx * config.num_users)), dim=-1)
             vec_w0 = vec_w0.reshape(-1, 2 * config.num_tx * config.num_users)
-
-            # ## Compute initial beamformer randomly
-            # vec_w0 = th.randn(batch_size, 2 * config.num_tx * config.num_users).to(device)
-
             norm_W0 = th.norm(vec_w0, dim=1, keepdim=True)
-            normlized_W0 = vec_w0 / norm_W0 # (B, beam_dim)
-            # Reconstruct complex beamformer from normalized vector
+            normlized_W0 = vec_w0 / norm_W0
+            # Reconstruct complex beamformer: (B, num_tx, num_users)
             W_mat_0 = (normlized_W0[:, :config.num_tx * config.num_users].reshape(-1, config.num_tx, config.num_users) +
                        1j * normlized_W0[:, config.num_tx * config.num_users:].reshape(-1, config.num_tx, config.num_users))
             rate_0 = sum_rate(H_mat, W_mat_0, sigma2=config.sigma2)
@@ -458,32 +453,33 @@ def train_beamforming_transformer(config):
                 mmse_rate_printed = True
                 print(f"MMSE Rate: {rate_0.item():.4f}")
             
-            # Use iterative process for T steps (learning-to-optimize loop)
-            # W_prev = normlized_W0  # Initial beamformer in vectorized form
-            W_prev = W_mat_0.transpose(-1, -2).to(device)  # (B, num_users, num_tx)
+            # Initialize W_prev (transpose to get shape (B, num_users, num_tx)).
+            W_prev = W_mat_0.transpose(-1, -2).to(device)
             total_rate = 0
             total_mse_loss = 0
-            # max_rate = 0
             for t in range(1, config.T + 1):
-                # Our model takes the current channel H and the previous beamformer W_prev to predict the next beamformer.
-                W_next = model(H_mat, W_prev) # (B, beam_dim)
-                
-                # Convert W_next to complex beamformer matrix shape (B, num_tx, num_users)
+                # The model predicts the next beamformer.
+                W_next = model(H_mat, W_prev)  # (B, beam_dim)
+                # Convert W_next to complex beamformer matrix: (B, num_tx, num_users)
                 W_mat = (W_next[:, :config.num_tx * config.num_users].reshape(-1, config.num_tx, config.num_users) +
                          1j * W_next[:, config.num_tx * config.num_users:].reshape(-1, config.num_tx, config.num_users))
                 W_prev = W_mat.transpose(-1, -2).to(device)  # (B, num_users, num_tx)
-                rate = sum_rate(H_mat, W_mat, sigma2=config.sigma2) ## unsupervised objective
-                mse_loss = fun.mse_loss(W_next, normlized_W0)  # MSE loss between predicted and initial beamformer
+                rate = sum_rate(H_mat, W_mat, sigma2=config.sigma2)
                 total_rate += rate
+
+                ### supervised MSE loss
+                mse_loss = fun.mse_loss(W_next, normlized_W0)
                 total_mse_loss += mse_loss
-                # max_rate = max(max_rate, rate.item())
+
+                # ### unsupervised MSE loss
+                # mse_loss = get_mmse_obj(H_mat, W_mat, sigma2=config.sigma2)   
+                # total_mse_loss += mse_loss.mean()            
+                
             
             loss_unsupervised = - total_rate / config.T
             loss_supervised = total_mse_loss / config.T
-            # print(f"unsupervised loss: {loss_unsupervised.item():.4f}, supervised loss: {loss_supervised.item():.4f}")
-            # bp()
-            loss = (1 - teacher_weight) * loss_unsupervised + (teacher_weight*2000) * loss_supervised
-            # loss = - total_rate / config.T
+            loss = (1 - teacher_weight) * loss_unsupervised + (teacher_weight * 2000) * loss_supervised ## supervised MSE
+            # loss = (1 - teacher_weight) * loss_unsupervised + (teacher_weight / 50) * loss_supervised ## supervised MSE
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
@@ -494,32 +490,27 @@ def train_beamforming_transformer(config):
             rate_history.append(th.tensor(ave_rate))
             max_rate = max(max_rate, ave_rate)
             pbar_batches += 1
-            pbar.set_description(f"Epoch {epoch+1}, Avg Rate: {(total_rate.item() / config.T):.4f}, Max Rate: {max_rate:.4f}")
+            pbar.set_description(f"Epoch {epoch+1}, Avg Rate: {ave_rate:.4f}, Max Rate: {max_rate:.4f}")
         
-        # Step the learning rate scheduler at the end of each epoch
         scheduler.step()
-        
-        # Optionally, print out the current learning rate for debugging
         current_lr = optimizer.param_groups[0]['lr']
         ave_pbar_rate = epoch_rate / pbar_batches
         test_pbar_rate = max_rate
-        ave_rate_history.append(th.tensor(ave_pbar_rate))
-        test_rate_history.append(th.tensor(test_pbar_rate))
         # print(f"Epoch {epoch+1} completed. Learning Rate: {current_lr:.2e}")
         print(f"Epoch {epoch+1} Average Sum Rate: {ave_pbar_rate:.4f}")
-        # print(f"Epoch {epoch+1} Average Loss: {epoch_loss/pbar_batches:.4f}, Average Sum Rate: {epoch_rate/pbar_batches:.4f}")
+        ave_rate_history.append(th.tensor(ave_pbar_rate))
+        test_rate_history.append(th.tensor(test_pbar_rate))
+
 
     rate_history = th.stack(rate_history)
     ave_rate_history = th.stack(ave_rate_history)
     test_rate_history = th.stack(test_rate_history)
-
-    th.save(rate_history, f"rate_train_history_{config.num_users}_{config.num_tx}_no_prod.pth")
-    th.save(ave_rate_history, f"rate_ave_history_{config.num_users}_{config.num_tx}_no_prod.pth")  
-    th.save(test_rate_history, f"rate_test_history_{config.num_users}_{config.num_tx}_no_prod.pth")
-
-    rate_history = th.load(f"rate_train_history_{config.num_users}_{config.num_tx}_no_prod.pth")
-    ave_rate_history = th.load(f"rate_ave_history_{config.num_users}_{config.num_tx}_no_prod.pth")
-    test_rate_history = th.load(f"rate_test_history_{config.num_users}_{config.num_tx}_no_prod.pth")
+    th.save(rate_history, f"rate_train_history_{config.num_users}_{config.num_tx}_bind_cl.pth")
+    rate_history = th.load(f"rate_train_history_{config.num_users}_{config.num_tx}_bind_cl.pth")
+    th.save(ave_rate_history, f"rate_ave_history_{config.num_users}_{config.num_tx}_bind_cl.pth")
+    ave_rate_history = th.load(f"rate_ave_history_{config.num_users}_{config.num_tx}_bind_cl.pth")
+    th.save(test_rate_history, f"rate_test_history_{config.num_users}_{config.num_tx}_bind_cl.pth")
+    test_rate_history = th.load(f"rate_test_history_{config.num_users}_{config.num_tx}_bind_cl.pth")
 
     # Create x-axis values for both plots
     x_rate_history = th.arange(len(rate_history))
@@ -529,23 +520,22 @@ def train_beamforming_transformer(config):
     plt.plot(x_rate_history, rate_history, marker='.', linestyle='-', color='b', label='Training Rate')
     plt.plot(x_test_rate_history, ave_rate_history, marker='*', linestyle='-', color='g', label='Average Rate')
     plt.plot(x_test_rate_history, test_rate_history, marker='o', linestyle='-', color='r', label='Testing Rate')
-    plt.title(f"Training and Testing Rate without prod when N={config.num_tx} and K={config.num_users}")
+    plt.title(f"Training and Testing Rate when N={config.num_tx} and K={config.num_users}")
     plt.legend()
     plt.xlabel("Epochs")
     plt.ylabel("Sum Rate")
     plt.grid(True, which="both", ls="--")
     plt.show()
 
-
 #############################################
 # 8. Config class
 #############################################
 class BeamformerTransformerConfig:
     def __init__(self, **kwargs):
-        self.d_model = kwargs['d_model']  # Transformer model dimension
-        self.beam_dim = kwargs['beam_dim']  # Beamformer dimension
-        self.n_head = kwargs['n_head'] # Number of attention heads
-        self.n_layers = kwargs['n_layers'] # Number of transformer layers
+        self.d_model = kwargs['d_model']      # Transformer model dimension
+        self.beam_dim = kwargs['beam_dim']      # Beamformer vector dimension
+        self.n_head = kwargs['n_head']          # Number of attention heads
+        self.n_layers = kwargs['n_layers']      # Number of transformer layers
         self.batch_size = kwargs['batch_size']
         self.learning_rate = kwargs['learning_rate']
         self.weight_decay = kwargs['weight_decay']
@@ -560,11 +550,13 @@ class BeamformerTransformerConfig:
         self.mlp_ratio = kwargs['mlp_ratio']
         self.subspace_dim = kwargs['subspace_dim']
         self.pbar_size = kwargs['pbar_size']
-
+        self.ini_sub_dim = kwargs['ini_sub_dim']
+        self.sub_dim_epoch = kwargs['sub_dim_epoch']
 
 if __name__ == "__main__":
-    # Set all parameters in the main function
-    num_users = 16 
+
+    # # Example configuration where num_users = num_tx = 16.
+    num_users = 16
     num_tx = 16
     d_model = 256 # Transformer single-token dimension
     beam_dim = 2*num_tx*num_users # Beamformer vector dimension
@@ -574,8 +566,8 @@ if __name__ == "__main__":
     batch_size = 256 
     learning_rate = 5e-5
     weight_decay = 0.05
-    max_epoch = 200
-    sigma2 = 1.0   
+    # max_epoch = 100
+    sigma2 = 1.0  
     SNR = 15
     SNR_power = 10 ** (SNR/10) # SNR power in dB
     attn_pdrop = 0.0
@@ -584,32 +576,54 @@ if __name__ == "__main__":
     resid_pdrop = 0.0
     mlp_ratio = 4
     subspace_dim = 4
-    pbar_size = 3000
+    pbar_size = 2000
+    ini_sub_dim = 4
+    sub_dim_epoch = 5
+    max_epoch = (2*num_users*num_tx*sub_dim_epoch) // ini_sub_dim
 
-    # # Set all parameters in the main function
-    # num_users = 4
-    # num_tx = 4
-    # d_model = 64 # Transformer single-token dimension
-    # beam_dim = 2*num_tx*num_users # Beamformer vector dimension
-    # n_head = 4 # Number of attention heads
-    # n_layers = 4 # Number of transformer layers
-    # T = 1 # Number of time steps
+    # # Example configuration where num_users = num_tx = 8.
+    # num_users = 8
+    # num_tx = 8
+    # d_model = 128          # Transformer token dimension
+    # beam_dim = 2 * num_tx * num_users  # Beamformer vector dimension
+    # n_head = 8
+    # n_layers = 5
+    # T = 1
     # batch_size = 256 
-    # learning_rate = 1e-4
-    # weight_decay = 0.1
+    # learning_rate = 5e-4
+    # weight_decay = 0.05
     # max_epoch = 200
     # sigma2 = 1.0  
     # SNR = 15
-    # SNR_power = 10 ** (SNR/10) # SNR power in dB
-    # attn_pdrop = 0.05
-    # # resid_pdrop = 0.05
-    # # attn_pdrop = 0.0
+    # SNR_power = 10 ** (SNR / 10)
+    # attn_pdrop = 0.0
+    # resid_pdrop = 0.0
+    # mlp_ratio = 4
+    # subspace_dim = 4
+    # pbar_size = 3000
+
+    # # Example configuration where num_users = num_tx = 4.
+    # num_users = 4
+    # num_tx = 4
+    # d_model = 64  # Transformer token dimension
+    # beam_dim = 2 * num_tx * num_users  # Beamformer vector dimension
+    # n_head = 4
+    # n_layers = 4
+    # T = 1
+    # batch_size = 256 
+    # learning_rate = 5e-4
+    # weight_decay = 0.05
+    # max_epoch = 200
+    # sigma2 = 1.0  
+    # SNR = 15
+    # SNR_power = 10 ** (SNR / 10)
+    # attn_pdrop = 0.0
     # resid_pdrop = 0.0
     # mlp_ratio = 4
     # subspace_dim = 4
     # pbar_size = 2000
     
-    # Create config object with parameters
+    # Create configuration object.
     config = BeamformerTransformerConfig(
         d_model=d_model,
         beam_dim=beam_dim,
@@ -623,35 +637,15 @@ if __name__ == "__main__":
         num_tx=num_tx,
         sigma2=sigma2,
         T=T,
-        SNR_power = SNR_power,
+        SNR_power=SNR_power,
         attn_pdrop=attn_pdrop,
-        resid_pdrop = resid_pdrop,
-        mlp_ratio = mlp_ratio,
-        subspace_dim = subspace_dim,
-        pbar_size = pbar_size
+        resid_pdrop=resid_pdrop,
+        mlp_ratio=mlp_ratio,
+        subspace_dim=subspace_dim,
+        pbar_size=pbar_size,
+        ini_sub_dim=ini_sub_dim,
+        sub_dim_epoch=sub_dim_epoch
     )
     
-    # Train the model with the given config
+    # Train the beamforming transformer.
     train_beamforming_transformer(config)
-
-
-
-
-# rate_history = th.load(f"rate_train_history_8_8.pth")
-# ave_rate_history = th.load(f"rate_ave_history_8_8.pth")
-# test_rate_history = th.load(f"rate_test_history_8_8.pth")
-
-# # Create x-axis values for both plots
-# x_rate_history = th.arange(len(rate_history))
-# x_test_rate_history = th.arange(len(test_rate_history)) * 2000  # Scale by pbar_size
-
-# plt.figure(figsize=(10, 6))
-# plt.plot(x_rate_history, rate_history, marker='.', linestyle='-', color='b', label='Training Rate')
-# plt.plot(x_test_rate_history, ave_rate_history, marker='*', linestyle='-', color='g', label='Average Rate')
-# plt.plot(x_test_rate_history, test_rate_history, marker='o', linestyle='-', color='r', label='Testing Rate')
-# plt.title(f"Training and Testing Rate when N=8 and K=8")
-# plt.legend()
-# plt.xlabel("Epochs")
-# plt.ylabel("Sum Rate")
-# plt.grid(True, which="both", ls="--")
-# plt.show()

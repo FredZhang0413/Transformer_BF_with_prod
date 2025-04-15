@@ -1,3 +1,4 @@
+
 import math
 import torch as th
 import torch.nn as nn
@@ -350,6 +351,13 @@ def configure_optimizer(model, learning_rate, weight_decay):
     optimizer = th.optim.AdamW(optimizer_grouped_parameters, lr=learning_rate)
     return optimizer
 
+def get_mmse_obj(H, W, sigma2=1.0):
+    prod = th.bmm(H, W)  # (B, num_users, num_users)
+    fro_norm = th.norm(prod, p='fro', dim=(1,2)) ** 2
+    trace_real = th.stack([th.trace(prod).real for prod in prod])
+    MSE_obj = fro_norm - trace_real
+    return MSE_obj
+
 #############################################
 # 6. Training Routine
 #############################################
@@ -370,7 +378,7 @@ def train_beamforming_transformer(config):
 
     # Learning rate scheduler that linearly decays lr.
     scheduler = th.optim.lr_scheduler.LambdaLR(
-        optimizer, lambda epoch: 1 - 0.0 * (epoch / config.max_epoch)
+        optimizer, lambda epoch: 1 - 0.3 * (epoch / config.max_epoch)
     )
     
     global mmse_rate_printed
@@ -383,7 +391,7 @@ def train_beamforming_transformer(config):
     
     for epoch in range(config.max_epoch):
         # Hard switch learning policy.
-        if epoch < 10:
+        if epoch < 5:
             teacher_weight = 1
         else:
             teacher_weight = 0.0
@@ -429,13 +437,21 @@ def train_beamforming_transformer(config):
                          1j * W_next[:, config.num_tx * config.num_users:].reshape(-1, config.num_tx, config.num_users))
                 W_prev = W_mat.transpose(-1, -2).to(device)  # (B, num_users, num_tx)
                 rate = sum_rate(H_mat, W_mat, sigma2=config.sigma2)
-                mse_loss = fun.mse_loss(W_next, normlized_W0)
                 total_rate += rate
+
+                ### supervised MSE loss
+                mse_loss = fun.mse_loss(W_next, normlized_W0)
                 total_mse_loss += mse_loss
+
+                # ### unsupervised MSE loss
+                # mse_loss = get_mmse_obj(H_mat, W_mat, sigma2=config.sigma2)   
+                # total_mse_loss += mse_loss.mean()            
+                
             
             loss_unsupervised = - total_rate / config.T
             loss_supervised = total_mse_loss / config.T
-            loss = (1 - teacher_weight) * loss_unsupervised + (teacher_weight * 2000) * loss_supervised
+            loss = (1 - teacher_weight) * loss_unsupervised + (teacher_weight * 2000) * loss_supervised ## supervised MSE
+            # loss = (1 - teacher_weight) * loss_unsupervised + (teacher_weight / 50) * loss_supervised ## supervised MSE
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
@@ -509,49 +525,49 @@ class BeamformerTransformerConfig:
 
 if __name__ == "__main__":
 
-    # # # Example configuration where num_users = num_tx = 16.
-    # num_users = 16
-    # num_tx = 16
-    # d_model = 256 # Transformer single-token dimension
-    # beam_dim = 2*num_tx*num_users # Beamformer vector dimension
-    # n_head = 8 # Number of attention heads
-    # n_layers = 6 # Number of transformer layers
-    # T = 1 # Number of time steps
-    # batch_size = 256 
-    # learning_rate = 3e-4
-    # weight_decay = 0.05
-    # max_epoch = 100
-    # sigma2 = 1.0  
-    # SNR = 15
-    # SNR_power = 10 ** (SNR/10) # SNR power in dB
-    # attn_pdrop = 0.0
-    # # resid_pdrop = 0.05
-    # # attn_pdrop = 0.0
-    # resid_pdrop = 0.0
-    # mlp_ratio = 4
-    # subspace_dim = 4
-    # pbar_size = 2000
-
-    # Example configuration where num_users = num_tx = 8.
-    num_users = 8
-    num_tx = 8
-    d_model = 128          # Transformer token dimension
-    beam_dim = 2 * num_tx * num_users  # Beamformer vector dimension
-    n_head = 8
-    n_layers = 5
-    T = 1
+    # # Example configuration where num_users = num_tx = 16.
+    num_users = 16
+    num_tx = 16
+    d_model = 256 # Transformer single-token dimension
+    beam_dim = 2*num_tx*num_users # Beamformer vector dimension
+    n_head = 8 # Number of attention heads
+    n_layers = 8 # Number of transformer layers
+    T = 1 # Number of time steps
     batch_size = 256 
-    learning_rate = 5e-4
+    learning_rate = 5e-5
     weight_decay = 0.05
-    max_epoch = 200
+    max_epoch = 100
     sigma2 = 1.0  
     SNR = 15
-    SNR_power = 10 ** (SNR / 10)
+    SNR_power = 10 ** (SNR/10) # SNR power in dB
     attn_pdrop = 0.0
+    # resid_pdrop = 0.05
+    # attn_pdrop = 0.0
     resid_pdrop = 0.0
     mlp_ratio = 4
     subspace_dim = 4
     pbar_size = 3000
+
+    # # Example configuration where num_users = num_tx = 8.
+    # num_users = 8
+    # num_tx = 8
+    # d_model = 128          # Transformer token dimension
+    # beam_dim = 2 * num_tx * num_users  # Beamformer vector dimension
+    # n_head = 8
+    # n_layers = 5
+    # T = 1
+    # batch_size = 256 
+    # learning_rate = 5e-4
+    # weight_decay = 0.05
+    # max_epoch = 200
+    # sigma2 = 1.0  
+    # SNR = 15
+    # SNR_power = 10 ** (SNR / 10)
+    # attn_pdrop = 0.0
+    # resid_pdrop = 0.0
+    # mlp_ratio = 4
+    # subspace_dim = 4
+    # pbar_size = 3000
 
     # # Example configuration where num_users = num_tx = 4.
     # num_users = 4
