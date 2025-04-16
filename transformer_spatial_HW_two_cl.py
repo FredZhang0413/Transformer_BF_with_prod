@@ -1,3 +1,4 @@
+
 import math
 import torch as th
 import torch.nn as nn
@@ -179,8 +180,7 @@ class BeamformingTransformer(nn.Module):
         # Final fusion and output projection MLP.
         self.out_proj = nn.Sequential(
             nn.Linear((2 * self.N + 2 * self.K) * config.d_model, config.d_model),
-            # nn.ReLU(),
-            nn.LeakyReLU(negative_slope=0.01),  
+            nn.ReLU(),  
             nn.Linear(config.d_model, config.beam_dim)
         )
         
@@ -313,15 +313,24 @@ class ChannelDataset(Dataset):
         return self.num_samples
     
     def __getitem__(self, idx):
-        # Generate complex channel matrix (real + imaginary parts)
-        # H_gen = th.randn(self.num_users, self.num_tx, dtype=th.cfloat) 
-        # H_real = H_gen.real
-        # H_imag = H_gen.imag
-        scale = math.sqrt(2) / 2
-        H_real = th.randn(self.num_users, self.num_tx) * scale
-        H_imag = th.randn(self.num_users, self.num_tx) * scale
-        H_combined = th.stack([H_real, H_imag], dim=0)  # Shape: (2, num_users, num_tx)
-        H_combined = H_combined * (self.P ** 0.5)
+        coordinates = th.randn(self.subspace_dim, 1)
+        basis_vectors_subset = self.basis_vectors[:self.subspace_dim].T
+        vec_channel = th.matmul(basis_vectors_subset, coordinates).reshape(2 * self.num_users * self.num_tx)
+        H_real = vec_channel[:self.num_tx * self.num_users].reshape(self.num_users, self.num_tx) ### (num_users, num_tx)
+        H_imag = vec_channel[self.num_tx * self.num_users:].reshape(self.num_users, self.num_tx) ### (num_users, num_tx)
+        H_complex = H_real + 1j * H_imag
+        norm_H_complex = th.sum(th.abs(H_complex)**2)
+        SNR_power = self.num_users*self.num_tx*self.P
+        H_real = H_real * th.sqrt((SNR_power*0.5) / norm_H_complex) ### (num_users, num_tx)
+        H_imag = H_imag * th.sqrt((SNR_power*0.5) / norm_H_complex) ### (num_users, num_tx)
+        H_combined = th.stack([H_real, H_imag], dim=0) ### Shape: (2, num_users, num_tx)
+
+        # scale = math.sqrt(2) / 2
+        # H_real = th.randn(self.num_users, self.num_tx) * scale
+        # H_imag = th.randn(self.num_users, self.num_tx) * scale
+        # H_combined = th.stack([H_real, H_imag], dim=0)  # Shape: (2, num_users, num_tx)
+        # H_combined = H_combined * (self.P ** 0.5)
+
         return th.tensor(H_combined)
 
 #############################################
@@ -351,6 +360,13 @@ def configure_optimizer(model, learning_rate, weight_decay):
     optimizer = th.optim.AdamW(optimizer_grouped_parameters, lr=learning_rate)
     return optimizer
 
+def get_mmse_obj(H, W, sigma2=1.0):
+    prod = th.bmm(H, W)  # (B, num_users, num_users)
+    fro_norm = th.norm(prod, p='fro', dim=(1,2)) ** 2
+    trace_real = th.stack([th.trace(prod).real for prod in prod])
+    MSE_obj = fro_norm - trace_real
+    return MSE_obj
+
 #############################################
 # 6. Training Routine
 #############################################
@@ -358,12 +374,12 @@ def train_beamforming_transformer(config):
     """
     Train the beamforming transformer based on the given configuration.
     """
-    dataset = ChannelDataset(num_samples=config.pbar_size * config.batch_size,
-                             num_users=config.num_users,
-                             num_tx=config.num_tx,
-                             P=config.SNR_power,
-                             subspace_dim=config.subspace_dim)
-    dataloader = DataLoader(dataset, batch_size=config.batch_size, shuffle=True)
+    # dataset = ChannelDataset(num_samples=config.pbar_size * config.batch_size,
+    #                          num_users=config.num_users,
+    #                          num_tx=config.num_tx,
+    #                          P=config.SNR_power,
+    #                          subspace_dim=config.subspace_dim)
+    # dataloader = DataLoader(dataset, batch_size=config.batch_size, shuffle=True)
     
     device = th.device("cuda" if th.cuda.is_available() else "cpu")
     model = BeamformingTransformer(config).to(device)
@@ -371,23 +387,40 @@ def train_beamforming_transformer(config):
 
     # Learning rate scheduler that linearly decays lr.
     scheduler = th.optim.lr_scheduler.LambdaLR(
-        optimizer, lambda epoch: 1 - 0.0 * (epoch / config.max_epoch)
+        optimizer, lambda epoch: 1 - 0.3 * (epoch / config.max_epoch)
     )
     
     global mmse_rate_printed
     mmse_rate_printed = False
     model.train()
-    teacher_weight = 0  # 0 or 1 depending on epoch switching
+    
     rate_history = []
     test_rate_history = []
     ave_rate_history = []
+
+    teacher_weight = 0  # 0 or 1 depending on epoch switching
+    initial_subspace_dim = config.ini_sub_dim
+    cl_increment = config.ini_sub_dim
+    # current_subspace_dim = initial_subspace_dim
     
     for epoch in range(config.max_epoch):
-        # Hard switch learning policy.
-        if epoch < 3:
-            teacher_weight = 1
-        else:
-            teacher_weight = 0.0
+
+        current_subspace_dim = min(initial_subspace_dim + epoch * cl_increment, 2*config.num_users * config.num_tx)
+        teacher_weight = min(1, teacher_weight + 0.01)  # Gradually increase teacher weight
+        print(f"Current subspace dimension and teacher weight: {current_subspace_dim}, {teacher_weight:.2f}")
+
+        dataset = ChannelDataset(num_samples=config.pbar_size*config.batch_size, 
+                                 num_users=config.num_users, 
+                                 num_tx=config.num_tx, 
+                                 P=config.SNR_power, 
+                                 subspace_dim=current_subspace_dim)
+        dataloader = DataLoader(dataset, batch_size=config.batch_size, shuffle=True)
+
+        # # Hard switch learning policy.
+        # if epoch % config.sub_dim_epoch == 0:
+        #     teacher_weight = 1
+        # else:
+        #     teacher_weight = 0.0
 
         epoch_loss = 0
         epoch_rate = 0
@@ -430,13 +463,21 @@ def train_beamforming_transformer(config):
                          1j * W_next[:, config.num_tx * config.num_users:].reshape(-1, config.num_tx, config.num_users))
                 W_prev = W_mat.transpose(-1, -2).to(device)  # (B, num_users, num_tx)
                 rate = sum_rate(H_mat, W_mat, sigma2=config.sigma2)
-                mse_loss = fun.mse_loss(W_next, normlized_W0)
                 total_rate += rate
+
+                ### supervised MSE loss
+                mse_loss = fun.mse_loss(W_next, normlized_W0)
                 total_mse_loss += mse_loss
+
+                # ### unsupervised MSE loss
+                # mse_loss = get_mmse_obj(H_mat, W_mat, sigma2=config.sigma2)   
+                # total_mse_loss += mse_loss.mean()            
+                
             
             loss_unsupervised = - total_rate / config.T
             loss_supervised = total_mse_loss / config.T
-            loss = (1 - teacher_weight) * loss_unsupervised + (teacher_weight * 2000) * loss_supervised
+            loss = (1 - teacher_weight) * loss_unsupervised + (teacher_weight * 2000) * loss_supervised ## supervised MSE
+            # loss = (1 - teacher_weight) * loss_unsupervised + (teacher_weight / 50) * loss_supervised ## supervised MSE
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
@@ -462,12 +503,12 @@ def train_beamforming_transformer(config):
     rate_history = th.stack(rate_history)
     ave_rate_history = th.stack(ave_rate_history)
     test_rate_history = th.stack(test_rate_history)
-    th.save(rate_history, f"rate_train_history_{config.num_users}_{config.num_tx}.pth")
-    rate_history = th.load(f"rate_train_history_{config.num_users}_{config.num_tx}.pth")
-    th.save(ave_rate_history, f"rate_ave_history_{config.num_users}_{config.num_tx}.pth")
-    ave_rate_history = th.load(f"rate_ave_history_{config.num_users}_{config.num_tx}.pth")
-    th.save(test_rate_history, f"rate_test_history_{config.num_users}_{config.num_tx}.pth")
-    test_rate_history = th.load(f"rate_test_history_{config.num_users}_{config.num_tx}.pth")
+    th.save(rate_history, f"rate_train_history_{config.num_users}_{config.num_tx}_bind_cl.pth")
+    rate_history = th.load(f"rate_train_history_{config.num_users}_{config.num_tx}_bind_cl.pth")
+    th.save(ave_rate_history, f"rate_ave_history_{config.num_users}_{config.num_tx}_bind_cl.pth")
+    ave_rate_history = th.load(f"rate_ave_history_{config.num_users}_{config.num_tx}_bind_cl.pth")
+    th.save(test_rate_history, f"rate_test_history_{config.num_users}_{config.num_tx}_bind_cl.pth")
+    test_rate_history = th.load(f"rate_test_history_{config.num_users}_{config.num_tx}_bind_cl.pth")
 
     # Create x-axis values for both plots
     x_rate_history = th.arange(len(rate_history))
@@ -507,52 +548,55 @@ class BeamformerTransformerConfig:
         self.mlp_ratio = kwargs['mlp_ratio']
         self.subspace_dim = kwargs['subspace_dim']
         self.pbar_size = kwargs['pbar_size']
+        self.ini_sub_dim = kwargs['ini_sub_dim']
 
 if __name__ == "__main__":
 
-    # # # Example configuration where num_users = num_tx = 16.
-    # num_users = 16
-    # num_tx = 16
-    # d_model = 256 # Transformer single-token dimension
-    # beam_dim = 2*num_tx*num_users # Beamformer vector dimension
-    # n_head = 8 # Number of attention heads
-    # n_layers = 6 # Number of transformer layers
-    # T = 1 # Number of time steps
-    # batch_size = 256 
-    # learning_rate = 5e-5
-    # weight_decay = 0.05
+    # # Example configuration where num_users = num_tx = 16.
+    num_users = 16
+    num_tx = 16
+    d_model = 256 # Transformer single-token dimension
+    beam_dim = 2*num_tx*num_users # Beamformer vector dimension
+    n_head = 8 # Number of attention heads
+    n_layers = 6 # Number of transformer layers
+    T = 1 # Number of time steps
+    batch_size = 256 
+    learning_rate = 5e-5
+    weight_decay = 0.05
     # max_epoch = 100
+    sigma2 = 1.0  
+    SNR = 15
+    SNR_power = 10 ** (SNR/10) # SNR power in dB
+    attn_pdrop = 0.0
+    # resid_pdrop = 0.05
+    # attn_pdrop = 0.0
+    resid_pdrop = 0.0
+    mlp_ratio = 4
+    subspace_dim = 4
+    pbar_size = 2000
+    ini_sub_dim = 4
+    max_epoch = (2*num_users*num_tx) // ini_sub_dim
+
+    # # Example configuration where num_users = num_tx = 8.
+    # num_users = 8
+    # num_tx = 8
+    # d_model = 128          # Transformer token dimension
+    # beam_dim = 2 * num_tx * num_users  # Beamformer vector dimension
+    # n_head = 8
+    # n_layers = 5
+    # T = 1
+    # batch_size = 256 
+    # learning_rate = 5e-4
+    # weight_decay = 0.05
+    # max_epoch = 200
     # sigma2 = 1.0  
     # SNR = 15
-    # SNR_power = 10 ** (SNR/10) # SNR power in dB
+    # SNR_power = 10 ** (SNR / 10)
     # attn_pdrop = 0.0
-    # # resid_pdrop = 0.05
-    # # attn_pdrop = 0.0
     # resid_pdrop = 0.0
     # mlp_ratio = 4
     # subspace_dim = 4
     # pbar_size = 3000
-
-    # Example configuration where num_users = num_tx = 8.
-    num_users = 8
-    num_tx = 8
-    d_model = 128          # Transformer token dimension
-    beam_dim = 2 * num_tx * num_users  # Beamformer vector dimension
-    n_head = 8
-    n_layers = 5
-    T = 1
-    batch_size = 256 
-    learning_rate = 5e-4
-    weight_decay = 0.05
-    max_epoch = 100
-    sigma2 = 1.0  
-    SNR = 15
-    SNR_power = 10 ** (SNR / 10)
-    attn_pdrop = 0.0
-    resid_pdrop = 0.0
-    mlp_ratio = 4
-    subspace_dim = 4
-    pbar_size = 3000
 
     # # Example configuration where num_users = num_tx = 4.
     # num_users = 4
@@ -594,7 +638,8 @@ if __name__ == "__main__":
         resid_pdrop=resid_pdrop,
         mlp_ratio=mlp_ratio,
         subspace_dim=subspace_dim,
-        pbar_size=pbar_size
+        pbar_size=pbar_size,
+        ini_sub_dim=ini_sub_dim
     )
     
     # Train the beamforming transformer.

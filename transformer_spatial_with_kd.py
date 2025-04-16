@@ -637,21 +637,31 @@ if __name__ == "__main__":
 
 
 
-# rate_history = th.load(f"rate_train_history_8_8.pth")
-# ave_rate_history = th.load(f"rate_ave_history_8_8.pth")
-# test_rate_history = th.load(f"rate_test_history_8_8.pth")
+# # rate_history = th.load(f"rate_train_history_8_8.pth")
+# # ave_rate_history = th.load(f"rate_ave_history_8_8.pth")
+# # test_rate_history = th.load(f"rate_test_history_8_8.pth")
+# rate_history = th.load("D:/phd_2025_spring/Transformer_BF_with_prod-main/Transformer_BF_with_prod-main/hist_record/rate_train_history_16_16.pth")
+# ave_rate_history = th.load("D:/phd_2025_spring/Transformer_BF_with_prod-main/Transformer_BF_with_prod-main/hist_record/rate_ave_history_16_16.pth")
+# test_rate_history = th.load("D:/phd_2025_spring/Transformer_BF_with_prod-main/Transformer_BF_with_prod-main/hist_record/rate_test_history_16_16.pth")
+# # rate_history = rate_history * 1.05
+# # ave_rate_history = ave_rate_history * 1.07
+# wmmse_history = th.tensor([52.07755418089099 for _ in range(len(ave_rate_history))])
+# mmse_history = th.tensor([43.94968651013214 for _ in range(len(ave_rate_history))])
 
 # # Create x-axis values for both plots
-# x_rate_history = th.arange(len(rate_history))
-# x_test_rate_history = th.arange(len(test_rate_history)) * 2000  # Scale by pbar_size
+# x_train_rate_history = th.arange(len(rate_history))
+# x_test_rate_history = th.arange(len(ave_rate_history)) * 3000  # Scale by pbar_size
 
 # plt.figure(figsize=(10, 6))
-# plt.plot(x_rate_history, rate_history, marker='.', linestyle='-', color='b', label='Training Rate')
-# plt.plot(x_test_rate_history, ave_rate_history, marker='*', linestyle='-', color='g', label='Average Rate')
-# plt.plot(x_test_rate_history, test_rate_history, marker='o', linestyle='-', color='r', label='Testing Rate')
-# plt.title(f"Training and Testing Rate when N=8 and K=8")
+# plt.plot(x_train_rate_history, rate_history, marker='.', linestyle='-', color='b', label='Training Rate')
+# plt.plot(x_test_rate_history, ave_rate_history, marker='*', linestyle='-', color='r', label='Testing Rate')
+# plt.plot(x_test_rate_history, wmmse_history, marker='.', linestyle='--', color='k', label='WMMSE Rate')
+# plt.plot(x_test_rate_history, mmse_history, marker='.', linestyle='--', color='g', label='MMSE Rate')
+# # plt.plot(x_test_rate_history, test_rate_history, marker='o', linestyle='-', color='r', label='Testing Rate')
+# plt.title(f"Training and Testing Rate when N=16 and K=16")
 # plt.legend()
 # plt.xlabel("Epochs")
 # plt.ylabel("Sum Rate")
 # plt.grid(True, which="both", ls="--")
 # plt.show()
+
