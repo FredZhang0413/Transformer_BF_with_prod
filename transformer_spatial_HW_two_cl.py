@@ -178,10 +178,23 @@ class BeamformingTransformer(nn.Module):
                                                      attn_pdrop=config.attn_pdrop, resid_pdrop=config.resid_pdrop)
         
         # Final fusion and output projection MLP.
+        total_tokens = 2*self.N + 2*self.K
+        # self.out_mlp = nn.Sequential(
+        #     nn.Linear(total_tokens * d_model, d_model),
+        #     # nn.ReLU(),  
+        #     nn.LeakyReLU(negative_slope=0.01),
+        #     nn.Linear(d_model, config.beam_dim)
+        # )
         self.out_proj = nn.Sequential(
-            nn.Linear((2 * self.N + 2 * self.K) * config.d_model, config.d_model),
-            nn.ReLU(),  
-            nn.Linear(config.d_model, config.beam_dim)
+            nn.Linear(total_tokens * config.d_model, 4 * config.d_model),
+            nn.LayerNorm(4 * config.d_model),
+            nn.GELU(),
+            nn.Dropout(config.resid_pdrop),
+            nn.Linear(4 * config.d_model, 2 * config.d_model),
+            nn.LayerNorm(2 * config.d_model),
+            nn.GELU(),
+            nn.Dropout(config.resid_pdrop),
+            nn.Linear(2 * config.d_model, config.beam_dim),
         )
         
         # Weight initialization.
@@ -406,7 +419,7 @@ def train_beamforming_transformer(config):
     for epoch in range(config.max_epoch):
 
         current_subspace_dim = min(initial_subspace_dim + epoch * cl_increment, 2*config.num_users * config.num_tx)
-        teacher_weight = min(1, teacher_weight + 0.04)  # Gradually increase teacher weight
+        teacher_weight = min(1, teacher_weight + 0.02)  # Gradually increase teacher weight
         print(f"Current subspace dimension and teacher weight: {current_subspace_dim}, {teacher_weight:.2f}")
 
         dataset = ChannelDataset(num_samples=config.pbar_size*config.batch_size, 
@@ -561,7 +574,7 @@ if __name__ == "__main__":
     n_layers = 6 # Number of transformer layers
     T = 1 # Number of time steps
     batch_size = 256 
-    learning_rate = 5e-5
+    learning_rate = 1e-4
     weight_decay = 0.05
     # max_epoch = 100
     sigma2 = 1.0  
@@ -573,8 +586,8 @@ if __name__ == "__main__":
     resid_pdrop = 0.0
     mlp_ratio = 4
     subspace_dim = 4
-    pbar_size = 2000
-    ini_sub_dim = 16
+    pbar_size = 1000
+    ini_sub_dim = 8
     max_epoch = (2*num_users*num_tx) // ini_sub_dim
 
     # # Example configuration where num_users = num_tx = 8.

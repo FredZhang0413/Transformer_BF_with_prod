@@ -148,11 +148,23 @@ class TransformerStep(nn.Module):
                                                      attn_pdrop=config.attn_pdrop, resid_pdrop=config.resid_pdrop)
         
         # Fusion MLP: fuse flattened antenna and user branch features.
-        fused_input_dim = self.t * (2 * self.N + 2 * self.K) * config.d_model
+        total_tokens = 2*self.N + 2*self.K
+        # self.out_mlp = nn.Sequential(
+        #     nn.Linear(total_tokens * d_model, d_model),
+        #     # nn.ReLU(),  
+        #     nn.LeakyReLU(negative_slope=0.01),
+        #     nn.Linear(d_model, config.beam_dim)
+        # )
         self.out_proj = nn.Sequential(
-            nn.Linear(fused_input_dim, config.d_model),
-            nn.LeakyReLU(negative_slope=0.01),
-            nn.Linear(config.d_model, config.beam_dim)
+            nn.Linear(total_tokens * config.d_model, 4 * config.d_model),
+            nn.LayerNorm(4 * config.d_model),
+            nn.GELU(),
+            nn.Dropout(config.resid_pdrop),
+            nn.Linear(4 * config.d_model, 2 * config.d_model),
+            nn.LayerNorm(2 * config.d_model),
+            nn.GELU(),
+            nn.Dropout(config.resid_pdrop),
+            nn.Linear(2 * config.d_model, config.beam_dim),
         )
         
         # Initialize weights.
@@ -415,7 +427,7 @@ def train_beamforming_transformer(config):
 
     # Learning rate scheduler that linearly decays.
     scheduler = th.optim.lr_scheduler.LambdaLR(
-        optimizer, lambda epoch: 1 - 0.0 * (epoch / config.max_epoch)
+        optimizer, lambda epoch: 1 - 0.3 * (epoch / config.max_epoch)
     )
     
     global mmse_rate_printed
@@ -512,12 +524,12 @@ def train_beamforming_transformer(config):
     rate_history = th.stack(rate_history)
     ave_rate_history = th.stack(ave_rate_history)
     test_rate_history = th.stack(test_rate_history)
-    th.save(rate_history, f"rate_train_history_{config.num_users}_{config.num_tx}.pth")
-    rate_history = th.load(f"rate_train_history_{config.num_users}_{config.num_tx}.pth")
-    th.save(ave_rate_history, f"rate_ave_history_{config.num_users}_{config.num_tx}.pth")
-    ave_rate_history = th.load(f"rate_ave_history_{config.num_users}_{config.num_tx}.pth")
-    th.save(test_rate_history, f"rate_test_history_{config.num_users}_{config.num_tx}.pth")
-    test_rate_history = th.load(f"rate_test_history_{config.num_users}_{config.num_tx}.pth")
+    th.save(rate_history, f"rate_train_history_{config.num_users}_{config.num_tx}_untied.pth")
+    rate_history = th.load(f"rate_train_history_{config.num_users}_{config.num_tx}_untied.pth")
+    th.save(ave_rate_history, f"rate_ave_history_{config.num_users}_{config.num_tx}_untied.pth")
+    ave_rate_history = th.load(f"rate_ave_history_{config.num_users}_{config.num_tx}_untied.pth")
+    th.save(test_rate_history, f"rate_test_history_{config.num_users}_{config.num_tx}_untied.pth")
+    test_rate_history = th.load(f"rate_test_history_{config.num_users}_{config.num_tx}_untied.pth")
 
     # Create x-axis values for plots.
     x_rate_history = th.arange(len(rate_history))
@@ -559,26 +571,51 @@ class BeamformerTransformerConfig:
         self.pbar_size = kwargs['pbar_size']
 
 if __name__ == "__main__":
-    # Example configuration where num_users = num_tx = 8.
-    num_users = 8
-    num_tx = 8
-    d_model = 128          # Transformer token dimension.
-    beam_dim = 2 * num_tx * num_users  # Beamformer vector dimension.
-    n_head = 8
-    n_layers = 5
-    T = 5                  # Number of L2O steps set to 5.
+    # # Example configuration where num_users = num_tx = 16.
+    num_users = 16
+    num_tx = 16
+    d_model = 256 # Transformer single-token dimension
+    beam_dim = 2*num_tx*num_users # Beamformer vector dimension
+    n_head = 8 # Number of attention heads
+    n_layers = 6 # Number of transformer layers
+    T = 1 # Number of time steps
     batch_size = 256 
-    learning_rate = 5e-5
+    learning_rate = 1e-4
     weight_decay = 0.05
-    max_epoch = 100
+    max_epoch = 300
     sigma2 = 1.0  
     SNR = 15
-    SNR_power = 10 ** (SNR / 10)
+    SNR_power = 10 ** (SNR/10) # SNR power in dB
     attn_pdrop = 0.0
+    # resid_pdrop = 0.05
+    # attn_pdrop = 0.0
     resid_pdrop = 0.0
     mlp_ratio = 4
     subspace_dim = 4
-    pbar_size = 2000
+    pbar_size = 1000
+    # ini_sub_dim = 8
+    # max_epoch = (2*num_users*num_tx) // ini_sub_dim
+
+    # # Example configuration where num_users = num_tx = 8.
+    # num_users = 8
+    # num_tx = 8
+    # d_model = 128          # Transformer token dimension.
+    # beam_dim = 2 * num_tx * num_users  # Beamformer vector dimension.
+    # n_head = 8
+    # n_layers = 5
+    # T = 5                  # Number of L2O steps set to 5.
+    # batch_size = 256 
+    # learning_rate = 5e-5
+    # weight_decay = 0.05
+    # max_epoch = 100
+    # sigma2 = 1.0  
+    # SNR = 15
+    # SNR_power = 10 ** (SNR / 10)
+    # attn_pdrop = 0.0
+    # resid_pdrop = 0.0
+    # mlp_ratio = 4
+    # subspace_dim = 4
+    # pbar_size = 2000
 
     # Create configuration object.
     config = BeamformerTransformerConfig(
