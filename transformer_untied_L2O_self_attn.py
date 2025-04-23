@@ -38,11 +38,11 @@ def sum_rate(H, W, sigma2=1.0):
     return reward
 
 #############################################
-# 2. Cross-Attention Block (unchanged from before).
+# Modified Cross-Attention Block supporting self-attention.
 #############################################
-class CrossAttentionBlock(nn.Module):
+class SelfAttentionBlock(nn.Module):
     def __init__(self, d_model, n_head, attn_pdrop, resid_pdrop):
-        super(CrossAttentionBlock, self).__init__()
+        super(SelfAttentionBlock, self).__init__()
         assert d_model % n_head == 0, "d_model must be divisible by n_head"
         self.n_head = n_head
         self.head_dim = d_model // n_head
@@ -61,9 +61,11 @@ class CrossAttentionBlock(nn.Module):
         # MLP block with an extra layer.
         self.mlp = nn.Sequential(
             nn.Linear(d_model, 4 * d_model),
+            # nn.LayerNorm(4 * d_model),
             nn.GELU(),
             nn.Dropout(resid_pdrop),
-            nn.Linear(4 * d_model, 4 * d_model),
+            nn.Linear(4 * d_model, 4 * d_model),  # additional layer
+            # nn.LayerNorm(4 * d_model),
             nn.GELU(),
             nn.Dropout(resid_pdrop),
             nn.Linear(4 * d_model, d_model),
@@ -72,38 +74,33 @@ class CrossAttentionBlock(nn.Module):
     
     def forward(self, query, key, value):
         """
-        Performs cross-attention with separate Query, Key, and Value tokens.
-        Args:
-            query: Tensor of shape (B, L_q, d_model).
-            key:   Tensor of shape (B, L_k, d_model).
-            value: Tensor of shape (B, L_v, d_model) (Assumes L_k == L_v).
-        Returns:
-            Output tensor of shape (B, L_q, d_model).
-        """
-        B, L_q, _ = query.size()
-        B, L_k, _ = key.size()
+        Performs cross-attention using separate Query, Key, and Value inputs.
         
-        # Apply LayerNorm.
+        Args:
+            query: Query tokens, shape (B, L, d_model).
+            key:   Key tokens, shape (B, L, d_model).
+            value: Value tokens, shape (B, L, d_model).
+        Returns:
+            Output with shape (B, L, d_model).
+        """
+        B, L, _ = query.size()
+        # Apply LayerNorm
         q_ln = self.ln1(query)
         k_ln = self.ln1(key)
         v_ln = self.ln1(value)
-        
-        # Linear projections and reshape for multi-head attention.
-        Q = self.q_proj(q_ln).view(B, L_q, self.n_head, self.head_dim).transpose(1, 2)
-        K = self.k_proj(k_ln).view(B, L_k, self.n_head, self.head_dim).transpose(1, 2)
-        V = self.v_proj(v_ln).view(B, L_k, self.n_head, self.head_dim).transpose(1, 2)
-        
+        # Compute Q, K, V and reshape for multi-head attention.
+        Q = self.q_proj(q_ln).view(B, L, self.n_head, self.head_dim).transpose(1, 2)  # (B, n_head, L, head_dim)
+        K = self.k_proj(k_ln).view(B, L, self.n_head, self.head_dim).transpose(1, 2)
+        V = self.v_proj(v_ln).view(B, L, self.n_head, self.head_dim).transpose(1, 2)
         # Scaled dot-product attention.
-        att = (Q @ K.transpose(-2, -1)) / math.sqrt(self.head_dim)
+        att = (Q @ K.transpose(-2, -1)) / math.sqrt(self.head_dim)  # (B, n_head, L, L)
         att = F.softmax(att, dim=-1)
         att = self.attn_drop(att)
-        
-        # Compute weighted sum.
-        y = att @ V
-        y = y.transpose(1, 2).contiguous().view(B, L_q, self.n_head * self.head_dim)
+        # Weighted sum of values.
+        y = att @ V  # (B, n_head, L, head_dim)
+        y = y.transpose(1, 2).contiguous().view(B, L, self.n_head * self.head_dim)
         y = self.proj(y)
         y = self.resid_drop(y)
-        
         # Residual connection and MLP.
         out = query + y
         out = out + self.mlp(self.ln2(out))
@@ -125,12 +122,13 @@ class TransformerStep(nn.Module):
         self.t = step_idx   # Number of historical beamformers used in the step.
         self.N = config.num_tx
         self.K = config.num_users
-        self.d_model = config.d_model
         
-        # Antenna-level branch (each history yields 2*N tokens after real-imag separation).
-        self.antenna_channel_proj = nn.Linear(self.K, config.d_model)
-        self.antenna_beam_proj = nn.Linear(self.K, config.d_model)
-        self.antenna_prod_proj = nn.Linear(self.K, config.d_model)
+        # New projection layers for tokens constructed from concatenated matrices.
+        # Each token (a column vector) has dimension N; project to d_model.
+        self.ant_proj = nn.Linear(self.K, config.d_model)
+        self.user_proj = nn.Linear(self.N, config.d_model)
+
+
         # Positional embedding for antenna branch: token count = t * 2*N.
         self.pos_emb_ant = nn.Parameter(th.zeros(self.t * 2 * self.N, config.d_model))
         # Cross-attention block.

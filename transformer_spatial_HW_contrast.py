@@ -136,11 +136,11 @@ class BeamformingTransformer(nn.Module):
         # )
         self.out_mlp = nn.Sequential(
             nn.Linear(total_tokens * d_model, 4 * d_model),
-            nn.LayerNorm(4 * d_model),
+            # nn.LayerNorm(4 * d_model),
             nn.GELU(),
             nn.Dropout(config.resid_pdrop),
             nn.Linear(4 * d_model, 2 * d_model),
-            nn.LayerNorm(2 * d_model),
+            # nn.LayerNorm(2 * d_model),
             nn.GELU(),
             nn.Dropout(config.resid_pdrop),
             nn.Linear(2 * d_model, config.beam_dim),

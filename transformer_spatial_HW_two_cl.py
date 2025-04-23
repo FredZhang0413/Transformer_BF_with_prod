@@ -187,11 +187,11 @@ class BeamformingTransformer(nn.Module):
         # )
         self.out_proj = nn.Sequential(
             nn.Linear(total_tokens * config.d_model, 4 * config.d_model),
-            nn.LayerNorm(4 * config.d_model),
+            # nn.LayerNorm(4 * config.d_model),
             nn.GELU(),
             nn.Dropout(config.resid_pdrop),
             nn.Linear(4 * config.d_model, 2 * config.d_model),
-            nn.LayerNorm(2 * config.d_model),
+            # nn.LayerNorm(2 * config.d_model),
             nn.GELU(),
             nn.Dropout(config.resid_pdrop),
             nn.Linear(2 * config.d_model, config.beam_dim),
@@ -411,7 +411,7 @@ def train_beamforming_transformer(config):
     test_rate_history = []
     ave_rate_history = []
 
-    teacher_weight = 0  # 0 or 1 depending on epoch switching
+    teacher_weight = 1  # start with full teacher weight
     initial_subspace_dim = config.ini_sub_dim
     cl_increment = config.ini_sub_dim
     # current_subspace_dim = initial_subspace_dim
@@ -419,7 +419,7 @@ def train_beamforming_transformer(config):
     for epoch in range(config.max_epoch):
 
         current_subspace_dim = min(initial_subspace_dim + epoch * cl_increment, 2*config.num_users * config.num_tx)
-        teacher_weight = min(1, teacher_weight + 0.02)  # Gradually increase teacher weight
+        teacher_weight = max(0, teacher_weight - 0.02)  # Gradually increase teacher weight
         print(f"Current subspace dimension and teacher weight: {current_subspace_dim}, {teacher_weight:.2f}")
 
         dataset = ChannelDataset(num_samples=config.pbar_size*config.batch_size, 
@@ -489,6 +489,8 @@ def train_beamforming_transformer(config):
             
             loss_unsupervised = - total_rate / config.T
             loss_supervised = total_mse_loss / config.T
+            # print(f"Loss: {loss_unsupervised:.4f}, Supervised Loss: {loss_supervised:.4f}")
+            # bp()
             loss = (1 - teacher_weight) * loss_unsupervised + (teacher_weight * 2000) * loss_supervised ## supervised MSE
             # loss = (1 - teacher_weight) * loss_unsupervised + (teacher_weight / 50) * loss_supervised ## supervised MSE
             optimizer.zero_grad()
@@ -581,12 +583,10 @@ if __name__ == "__main__":
     SNR = 15
     SNR_power = 10 ** (SNR/10) # SNR power in dB
     attn_pdrop = 0.0
-    # resid_pdrop = 0.05
-    # attn_pdrop = 0.0
     resid_pdrop = 0.0
     mlp_ratio = 4
     subspace_dim = 4
-    pbar_size = 1000
+    pbar_size = 2000
     ini_sub_dim = 8
     max_epoch = (2*num_users*num_tx) // ini_sub_dim
 

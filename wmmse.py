@@ -276,8 +276,8 @@ def compute_channel(nr_of_BS_antennas, nr_of_users, total_power, path_loss_optio
 
 if __name__ == '__main__':
     # Set variables 
-    nr_of_users = 8
-    nr_of_BS_antennas = 8
+    nr_of_users = 16
+    nr_of_BS_antennas = 16
     scheduled_users = np.arange(nr_of_users) # array of scheduled users. Note that we schedule all the users.
     epsilon = 1e-4 # used to end the iterations of the WMMSE algorithm in Shi et al. when the number of iterations is not fixed (note that the stopping criterion has precendence over the fixed number of iterations)
     power_tolerance = 1e-4 # used to end the bisection search in the WMMSE algorithm in Shi et al.

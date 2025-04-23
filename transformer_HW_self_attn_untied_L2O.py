@@ -7,7 +7,6 @@ import numpy as np
 from torch.utils.data import DataLoader, Dataset
 from tqdm import tqdm
 from baseline_mmse import compute_mmse_beamformer
-from pdb import set_trace as bp
 import torch.nn.functional as fun
 import matplotlib.pyplot as plt
 import warnings
@@ -32,17 +31,15 @@ def sum_rate(H, W, sigma2=1.0):
     prod = th.bmm(H, W)  # (B, num_users, num_users)
     signal_power = th.abs(th.diagonal(prod, dim1=-2, dim2=-1))**2
     interference = th.sum(th.abs(prod)**2, dim=-1) - signal_power
-    N = sigma2
-    SINR = signal_power / (interference + N)
-    reward = th.log2(1 + SINR).sum(dim=-1).mean()
-    return reward
+    SINR = signal_power / (interference + sigma2)
+    return th.log2(1 + SINR).sum(dim=-1).mean()
 
 #############################################
-# 2. Cross-Attention Block (unchanged from before).
+# Modified Cross-Attention Block supporting self-attention.
 #############################################
-class CrossAttentionBlock(nn.Module):
+class SelfAttentionBlock(nn.Module):
     def __init__(self, d_model, n_head, attn_pdrop, resid_pdrop):
-        super(CrossAttentionBlock, self).__init__()
+        super(SelfAttentionBlock, self).__init__()
         assert d_model % n_head == 0, "d_model must be divisible by n_head"
         self.n_head = n_head
         self.head_dim = d_model // n_head
@@ -63,7 +60,7 @@ class CrossAttentionBlock(nn.Module):
             nn.Linear(d_model, 4 * d_model),
             nn.GELU(),
             nn.Dropout(resid_pdrop),
-            nn.Linear(4 * d_model, 4 * d_model),
+            nn.Linear(4 * d_model, 4 * d_model),  # additional layer
             nn.GELU(),
             nn.Dropout(resid_pdrop),
             nn.Linear(4 * d_model, d_model),
@@ -72,83 +69,72 @@ class CrossAttentionBlock(nn.Module):
     
     def forward(self, query, key, value):
         """
-        Performs cross-attention with separate Query, Key, and Value tokens.
-        Args:
-            query: Tensor of shape (B, L_q, d_model).
-            key:   Tensor of shape (B, L_k, d_model).
-            value: Tensor of shape (B, L_v, d_model) (Assumes L_k == L_v).
-        Returns:
-            Output tensor of shape (B, L_q, d_model).
-        """
-        B, L_q, _ = query.size()
-        B, L_k, _ = key.size()
+        Performs cross-attention using separate Query, Key, and Value inputs.
         
-        # Apply LayerNorm.
+        Args:
+            query: Query tokens, shape (B, L, d_model).
+            key:   Key tokens, shape (B, L, d_model).
+            value: Value tokens, shape (B, L, d_model).
+        Returns:
+            Output with shape (B, L, d_model).
+        """
+        B, L, _ = query.size()
+        # Apply LayerNorm
         q_ln = self.ln1(query)
         k_ln = self.ln1(key)
         v_ln = self.ln1(value)
-        
-        # Linear projections and reshape for multi-head attention.
-        Q = self.q_proj(q_ln).view(B, L_q, self.n_head, self.head_dim).transpose(1, 2)
-        K = self.k_proj(k_ln).view(B, L_k, self.n_head, self.head_dim).transpose(1, 2)
-        V = self.v_proj(v_ln).view(B, L_k, self.n_head, self.head_dim).transpose(1, 2)
-        
+        # Compute Q, K, V and reshape for multi-head attention.
+        Q = self.q_proj(q_ln).view(B, L, self.n_head, self.head_dim).transpose(1, 2)  # (B, n_head, L, head_dim)
+        K = self.k_proj(k_ln).view(B, L, self.n_head, self.head_dim).transpose(1, 2)
+        V = self.v_proj(v_ln).view(B, L, self.n_head, self.head_dim).transpose(1, 2)
         # Scaled dot-product attention.
-        att = (Q @ K.transpose(-2, -1)) / math.sqrt(self.head_dim)
+        att = (Q @ K.transpose(-2, -1)) / math.sqrt(self.head_dim)  # (B, n_head, L, L)
         att = F.softmax(att, dim=-1)
         att = self.attn_drop(att)
-        
-        # Compute weighted sum.
-        y = att @ V
-        y = y.transpose(1, 2).contiguous().view(B, L_q, self.n_head * self.head_dim)
+        # Weighted sum of values.
+        y = att @ V  # (B, n_head, L, head_dim)
+        y = y.transpose(1, 2).contiguous().view(B, L, self.n_head * self.head_dim)
         y = self.proj(y)
         y = self.resid_drop(y)
-        
         # Residual connection and MLP.
         out = query + y
         out = out + self.mlp(self.ln2(out))
         return out
 
 #############################################
-# 3. TransformerStep: One untied L2O step.
+# 3. TransformerStep: simplified to use only previous step.
 #############################################
 class TransformerStep(nn.Module):
     def __init__(self, config, step_idx):
         """
-        Represents one untied transformer optimizer step.
+        One untied optimizer step that attends only to the immediate previous output.
         Args:
-            config: Configuration object.
-            step_idx: Step index (starting from 1). Determines the history length.
+            config: configuration object.
+            step_idx: current step index (1-based), used for logging but no longer for token repetition.
         """
-        super(TransformerStep, self).__init__()
-        self.step_idx = step_idx
-        self.t = step_idx   # Number of historical beamformers used in the step.
-        self.N = config.num_tx
+        super().__init__()
+        self.N = config.num_tx     # number of transmit antennas = num_users
         self.K = config.num_users
-        self.d_model = config.d_model
+
+        # New projection layers for tokens constructed from concatenated matrices.
+        # Each token (a column vector) has dimension N; project to d_model.
+        self.ant_proj = nn.Linear(self.N, config.d_model)
+        self.user_proj = nn.Linear(self.N, config.d_model)
         
-        # Antenna-level branch (each history yields 2*N tokens after real-imag separation).
-        self.antenna_channel_proj = nn.Linear(self.K, config.d_model)
-        self.antenna_beam_proj = nn.Linear(self.K, config.d_model)
-        self.antenna_prod_proj = nn.Linear(self.K, config.d_model)
-        # Positional embedding for antenna branch: token count = t * 2*N.
-        self.pos_emb_ant = nn.Parameter(th.zeros(self.t * 2 * self.N, config.d_model))
-        # Cross-attention block.
-        self.cross_attn_ant = CrossAttentionBlock(d_model=config.d_model, n_head=config.n_head, 
+        # Updated positional embeddings:
+        # For antenna-level tokens: there are 6N tokens.
+        self.pos_emb_ant = nn.Parameter(th.zeros(6 * self.N, config.d_model))
+        # For user-level tokens: there are also 6N tokens.
+        self.pos_emb_user = nn.Parameter(th.zeros(6 * self.K, config.d_model))
+        # Self-attention blocks (using the cross-attention module in self-attention mode).
+        self.self_attn_ant = SelfAttentionBlock(d_model=config.d_model, n_head=config.n_head, 
                                                     attn_pdrop=config.attn_pdrop, resid_pdrop=config.resid_pdrop)
-        
-        # User-level branch (each history yields 2*K tokens).
-        self.user_channel_proj = nn.Linear(self.N, config.d_model)
-        self.user_beam_proj = nn.Linear(self.N, config.d_model)
-        self.user_prod_proj = nn.Linear(self.K, config.d_model)
-        # Positional embedding for user branch: token count = t * 2*K.
-        self.pos_emb_user = nn.Parameter(th.zeros(self.t * 2 * self.K, config.d_model))
-        # Cross-attention block.
-        self.cross_attn_user = CrossAttentionBlock(d_model=config.d_model, n_head=config.n_head, 
+        self.self_attn_user = SelfAttentionBlock(d_model=config.d_model, n_head=config.n_head, 
                                                      attn_pdrop=config.attn_pdrop, resid_pdrop=config.resid_pdrop)
         
-        # Fusion MLP: fuse flattened antenna and user branch features.
-        total_tokens = 2*self.N + 2*self.K
+        # Final fusion and output projection.
+        # The fused feature dimension is 12N*d_model (6N from antenna + 6N from user).
+        total_tokens = 6*self.N + 6*self.K
         # self.out_mlp = nn.Sequential(
         #     nn.Linear(total_tokens * d_model, d_model),
         #     # nn.ReLU(),  
@@ -166,183 +152,104 @@ class TransformerStep(nn.Module):
             nn.Dropout(config.resid_pdrop),
             nn.Linear(2 * config.d_model, config.beam_dim),
         )
-        
-        # Initialize weights.
+        # Weight initialization
         self.apply(self._init_weights)
-        
+        print(f"Number of parameters: {sum(p.numel() for p in self.parameters()):,}")
+
     def _init_weights(self, module):
         if isinstance(module, nn.Linear):
             nn.init.normal_(module.weight, mean=0.0, std=0.02)
             if module.bias is not None:
                 nn.init.zeros_(module.bias)
-        elif isinstance(module, nn.LayerNorm):
-            nn.init.zeros_(module.bias)
-            nn.init.ones_(module.weight)
         elif isinstance(module, nn.Embedding):
             nn.init.normal_(module.weight, mean=0.0, std=0.02)
-    
+
     def forward(self, H, W_history, prod_history):
         """
-        Perform one L2O step using all historical beamformers and products.
         Args:
-            H: Complex channel matrix (B, K, N).
-            W_history: List of historical beamformers (each of shape (B, num_users, num_tx)).
-            prod_history: List of product matrices (each of shape (B, K, K)).
+            H: complex channel (B, K, N)
+            W_history: list of past beamformers; we only use the last one
+            prod_history: list of past products; only last one used
         Returns:
-            W_next: Next predicted beamformer (B, beam_dim) as a vector.
+            W_next: next beamformer vector (B, beam_dim)
         """
         B = H.size(0)
-        t = self.t  # Current history length; assert len(W_history)==t.
-        assert len(W_history) == t and len(prod_history) == t, "History length mismatch."
+
+        # --- Antenna‐level tokens (no repetition) ---
+        # Channel tokens: real & imag, shape (B, 2*N, K)
+        # H_ant = th.cat([H.real.transpose(1,2), H.imag.transpose(1,2)], dim=1)
+        # Beamformer tokens from previous step
+        W_prev = W_history[-1]
+        # W_ant = th.cat([W_prev.real.transpose(1,2), W_prev.imag.transpose(1,2)], dim=1)
+        # Product tokens from previous step
+        P_prev = prod_history[-1]
+        # V_ant = th.cat([P_prev.real.transpose(1,2), P_prev.imag.transpose(1,2)], dim=1)
+
+        C_ant = th.cat([H.real, H.imag, W_prev.real, W_prev.imag, P_prev.real, P_prev.imag], dim=2)
+        tokens_ant = C_ant.transpose(1, 2)  # (B, 6N, N)
+
+        # Project tokens into d_model and add positional embeddings.
+        tokens_ant_proj = self.ant_proj(tokens_ant)  # (B, 6N, d_model)
+        tokens_ant_proj = tokens_ant_proj + self.pos_emb_ant.unsqueeze(0)
+
+        # Perform self-attention on antenna-level tokens.
+        x_a = self.self_attn_ant(tokens_ant_proj, tokens_ant_proj, tokens_ant_proj)  # (B, 6N, d_model)
+
+        # --- User‐level tokens (no repetition) ---
+        H_T = H.transpose(1, 2)
+        W_T = W_prev.transpose(1, 2)
+        Prod_T = P_prev.transpose(1, 2)
+        C_user = th.cat([H_T.real, H_T.imag, W_T.real, W_T.imag, Prod_T.real, Prod_T.imag], dim=2)
+        tokens_user = C_user.transpose(1, 2)  # (B, 6N, N)
+
+        # Project tokens into d_model and add positional embeddings.
+        tokens_user_proj = self.user_proj(tokens_user)  # (B, 6N, d_model)
+        tokens_user_proj = tokens_user_proj + self.pos_emb_user.unsqueeze(0)
         
-        # ------------------------------
-        # Antenna-level branch tokens.
-        # For each history, generate:
-        #   H tokens: (B, 2*N, K),
-        #   Beam tokens: (B, 2*N, K),
-        #   Product tokens: (B, 2*K, K).
-        # ------------------------------
-        H_ant_list = []
-        W_ant_list = []
-        V_ant_list = []
-        for i in range(t):
-            # Channel tokens from H: (B, 2*N, K)
-            H_ant = th.cat([H.real.transpose(1,2), H.imag.transpose(1,2)], dim=1)
-            # Beamformer tokens from history: (B, 2*N, K)
-            W_i = W_history[i]
-            W_ant = th.cat([W_i.real.transpose(1,2), W_i.imag.transpose(1,2)], dim=1)
-            # Product tokens from history: (B, 2*K, K)
-            prod_i = prod_history[i]
-            V_ant = th.cat([prod_i.real.transpose(1,2), prod_i.imag.transpose(1,2)], dim=1)
-            
-            H_ant_list.append(H_ant)
-            W_ant_list.append(W_ant)
-            V_ant_list.append(V_ant)
-        
-        # Concatenate along token dimension.
-        H_ant_all = th.cat(H_ant_list, dim=1)   # Shape: (B, t*2*N, K)
-        W_ant_all = th.cat(W_ant_list, dim=1)   # Shape: (B, t*2*N, K)
-        V_ant_all = th.cat(V_ant_list, dim=1)     # Shape: (B, t*2*K, K)
-        
-        # Project tokens.
-        H_ant_proj = self.antenna_channel_proj(H_ant_all)  # (B, t*2*N, d_model)
-        W_ant_proj = self.antenna_beam_proj(W_ant_all)       # (B, t*2*N, d_model)
-        V_ant_proj = self.antenna_prod_proj(V_ant_all)       # (B, t*2*K, d_model)
-        
-        # Add positional embeddings (shape: (t*2*N, d_model)).
-        H_ant_proj = H_ant_proj + self.pos_emb_ant.unsqueeze(0)
-        W_ant_proj = W_ant_proj + self.pos_emb_ant.unsqueeze(0)
-        V_ant_proj = V_ant_proj + self.pos_emb_ant.unsqueeze(0)
-        
-        # Antenna-level cross-attention.
-        x_a = self.cross_attn_ant(H_ant_proj, W_ant_proj, V_ant_proj)  # (B, t*2*N, d_model)
-        
-        # ------------------------------
-        # User-level branch tokens.
-        # For each history, generate:
-        #   H tokens: (B, 2*K, N),
-        #   Beam tokens: (B, 2*K, N),
-        #   Product tokens: (B, 2*K, K).
-        # ------------------------------
-        H_user_list = []
-        W_user_list = []
-        V_user_list = []
-        for i in range(t):
-            H_user = th.cat([H.real, H.imag], dim=1)  # (B, 2*K, N)
-            W_i = W_history[i]
-            W_user = th.cat([W_i.real, W_i.imag], dim=1)  # (B, 2*K, N)
-            prod_i = prod_history[i]
-            V_user = th.cat([prod_i.real, prod_i.imag], dim=1)  # (B, 2*K, K)
-            
-            H_user_list.append(H_user)
-            W_user_list.append(W_user)
-            V_user_list.append(V_user)
-            
-        H_user_all = th.cat(H_user_list, dim=1)  # (B, t*2*K, N)
-        W_user_all = th.cat(W_user_list, dim=1)    # (B, t*2*K, N)
-        V_user_all = th.cat(V_user_list, dim=1)    # (B, t*2*K, K)
-        
-        # Project tokens.
-        H_user_proj = self.user_channel_proj(H_user_all)  # (B, t*2*K, d_model)
-        W_user_proj = self.user_beam_proj(W_user_all)       # (B, t*2*K, d_model)
-        V_user_proj = self.user_prod_proj(V_user_all)       # (B, t*2*K, d_model)
-        
-        # Add positional embeddings.
-        H_user_proj = H_user_proj + self.pos_emb_user.unsqueeze(0)
-        W_user_proj = W_user_proj + self.pos_emb_user.unsqueeze(0)
-        V_user_proj = V_user_proj + self.pos_emb_user.unsqueeze(0)
-        
-        # User-level cross-attention.
-        x_u = self.cross_attn_user(H_user_proj, W_user_proj, V_user_proj)  # (B, t*2*K, d_model)
-        
-        # ------------------------------
-        # Fusion: Flatten and concatenate both branches.
-        # ------------------------------
-        x_a_flat = x_a.view(B, -1)  # (B, t*2*N*d_model)
-        x_u_flat = x_u.view(B, -1)  # (B, t*2*K*d_model)
-        x_fused = th.cat([x_a_flat, x_u_flat], dim=-1)  # (B, t*(2*N+2*K)*d_model)
-        
-        # Final output projection and normalization.
-        W_next = self.out_proj(x_fused)  # (B, beam_dim)
-        norm = th.norm(W_next, dim=1, keepdim=True)
-        W_next = W_next / norm
+        # Perform self-attention on user-level tokens.
+        x_u = self.self_attn_user(tokens_user_proj, tokens_user_proj, tokens_user_proj)  # (B, 6N, d_model)
+
+        # --- Fusion & Output ---
+        x_a_flat = x_a.view(B, -1)
+        x_u_flat = x_u.view(B, -1)
+        x = th.cat([x_a_flat, x_u_flat], dim=-1)
+        W_next = self.out_proj(x)
+        W_next = W_next / th.norm(W_next, dim=1, keepdim=True)
         return W_next
 
+
 #############################################
-# 4. Beamforming Transformer for L2O with untied steps.
+# 4. BeamformingTransformerL2O (unchanged).
 #############################################
 class BeamformingTransformerL2O(nn.Module):
     def __init__(self, config):
-        """
-        L2O transformer with untied parameters over T steps.
-        Args:
-            config: Configuration object (must include T).
-        """
-        super(BeamformingTransformerL2O, self).__init__()
+        super().__init__()
         self.config = config
-        self.T = config.T  # Number of optimization steps
-        # Create a list of untied transformer steps.
-        self.steps = nn.ModuleList([TransformerStep(config, step_idx=i+1) for i in range(self.T)])
-        total_params = sum(p.numel() for p in self.parameters())
-        print(f"Number of parameters in L2O model: {total_params:,}")
-    
+        self.T = config.T
+        self.steps = nn.ModuleList(
+            [TransformerStep(config, step_idx=i+1) for i in range(self.T)]
+        )
+        print(f"L2O parameters: {sum(p.numel() for p in self.parameters()):,}")
+
     def forward(self, H, W0):
-        """
-        Unroll the L2O optimization for T steps.
-        Args:
-            H: Complex channel matrix (B, num_users, num_tx), where num_users = K.
-            W0: Initial beamformer (from MMSE) in shape (B, num_users, num_tx).
-        Returns:
-            A list of predicted beamformers (each of shape (B, beam_dim)) for each step.
-        """
         B = H.size(0)
-        # The initial beamformer should have shape (B, num_users, num_tx).
-        W0_correct = W0  # Already in shape (B, num_users, num_tx).
-        # Initialize history lists.
-        W_history = []
-        prod_history = []
-        # Append the initial beamformer.
-        W_history.append(W0_correct)
-        # Compute the initial product: prod0 = H * (W0_correct)^T.
-        prod0 = th.bmm(H, W0_correct.transpose(-1, -2))
-        prod_history.append(prod0)
-        
-        # To store outputs from each L2O step.
-        W_list = []
-        # Unroll the optimization for T steps.
+        W_history = [W0]
+        prod_history = [th.bmm(H, W0.transpose(-1,-2))]
+        outputs = []
         for step in self.steps:
-            # Each step uses all historical beamformers and product matrices.
-            vec_W_next = step(H, W_history, prod_history) # (B, beam_dim)
-            W_mat = (vec_W_next[:, :config.num_tx * config.num_users].reshape(-1, config.num_tx, config.num_users) +
-                       1j * vec_W_next[:, config.num_tx * config.num_users:].reshape(-1, config.num_tx, config.num_users))
-            W_next = W_mat.transpose(-1, -2)  # Convert to (B, num_users, num_tx)
-            # Append current prediction to history.
-            W_history.append(W_next)
-            prod_next = th.bmm(H, W_mat)
-            prod_history.append(prod_next)
-            W_list.append(vec_W_next)
-        # Return the list of beamformer predictions from every step.
-        return W_list
+            vec = step(H, W_history, prod_history) # (B, beam_dim)
+            # reconstruct complex W and append
+            N = self.config.num_tx
+            K = self.config.num_users
+            real = vec[:, :N*K].reshape(-1, N, K)
+            imag = vec[:, N*K:].reshape(-1, N, K)
+            W_mat = real + 1j*imag # (B, N, K)
+            W_prev = W_mat.transpose(-1,-2) # (B, K, N)
+            W_history.append(W_prev)
+            prod_history.append(th.bmm(H, W_mat))
+            outputs.append(vec)
+        return outputs
+
 
 #############################################
 # 5. Channel dataset: random Gaussian H.
@@ -520,12 +427,12 @@ def train_beamforming_transformer(config):
     rate_history = th.stack(rate_history)
     ave_rate_history = th.stack(ave_rate_history)
     test_rate_history = th.stack(test_rate_history)
-    th.save(rate_history, f"rate_train_history_{config.num_users}_{config.num_tx}_untied.pth")
-    rate_history = th.load(f"rate_train_history_{config.num_users}_{config.num_tx}_untied.pth")
-    th.save(ave_rate_history, f"rate_ave_history_{config.num_users}_{config.num_tx}_untied.pth")
-    ave_rate_history = th.load(f"rate_ave_history_{config.num_users}_{config.num_tx}_untied.pth")
-    th.save(test_rate_history, f"rate_test_history_{config.num_users}_{config.num_tx}_untied.pth")
-    test_rate_history = th.load(f"rate_test_history_{config.num_users}_{config.num_tx}_untied.pth")
+    th.save(rate_history, f"rate_train_history_{config.num_users}_{config.num_tx}_untied_markov.pth")
+    rate_history = th.load(f"rate_train_history_{config.num_users}_{config.num_tx}_untied_markov.pth")
+    th.save(ave_rate_history, f"rate_ave_history_{config.num_users}_{config.num_tx}_untied_markov.pth")
+    ave_rate_history = th.load(f"rate_ave_history_{config.num_users}_{config.num_tx}_untied_markov.pth")
+    th.save(test_rate_history, f"rate_test_history_{config.num_users}_{config.num_tx}_untied_markov.pth")
+    test_rate_history = th.load(f"rate_test_history_{config.num_users}_{config.num_tx}_untied_markov.pth")
 
     # Create x-axis values for plots.
     x_rate_history = th.arange(len(rate_history))
@@ -567,6 +474,7 @@ class BeamformerTransformerConfig:
         self.pbar_size = kwargs['pbar_size']
 
 if __name__ == "__main__":
+
     # # Example configuration where num_users = num_tx = 16.
     num_users = 16
     num_tx = 16
@@ -576,9 +484,9 @@ if __name__ == "__main__":
     n_layers = 6 # Number of transformer layers
     T = 3 # Number of time steps
     batch_size = 256 
-    learning_rate = 1e-4
+    learning_rate = 5e-5
     weight_decay = 0.05
-    max_epoch = 300
+    max_epoch = 150
     sigma2 = 1.0  
     SNR = 15
     SNR_power = 10 ** (SNR/10) # SNR power in dB
@@ -588,7 +496,7 @@ if __name__ == "__main__":
     resid_pdrop = 0.0
     mlp_ratio = 4
     subspace_dim = 4
-    pbar_size = 1000
+    pbar_size = 1500
     # ini_sub_dim = 8
     # max_epoch = (2*num_users*num_tx) // ini_sub_dim
 

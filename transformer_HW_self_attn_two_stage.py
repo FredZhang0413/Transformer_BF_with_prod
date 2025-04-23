@@ -51,11 +51,11 @@ class SelfAttentionBlock(nn.Module):
         # MLP block with an extra layer.
         self.mlp = nn.Sequential(
             nn.Linear(d_model, 4 * d_model),
-            # nn.LayerNorm(4 * d_model),
+            nn.LayerNorm(4 * d_model),
             nn.GELU(),
             nn.Dropout(resid_pdrop),
             nn.Linear(4 * d_model, 4 * d_model),  # additional layer
-            # nn.LayerNorm(4 * d_model),
+            nn.LayerNorm(4 * d_model),
             nn.GELU(),
             nn.Dropout(resid_pdrop),
             nn.Linear(4 * d_model, d_model),
@@ -109,17 +109,11 @@ class BeamformingTransformer(nn.Module):
         
         # New projection layers for tokens constructed from concatenated matrices.
         # Each token (a column vector) has dimension N; project to d_model.
-        self.ant_proj = nn.Linear(self.K, config.d_model)
+        self.ant_proj = nn.Linear(self.N, config.d_model)
         self.user_proj = nn.Linear(self.N, config.d_model)
         
-        ## Updated positional embeddings:
-
-        # # 1. Treat every token equally
-        # self.pos_emb_ant = nn.Parameter(th.zeros(6 * self.N, config.d_model))
-        # # For user-level tokens: there are also 6N tokens.
-        # self.pos_emb_user = nn.Parameter(th.zeros(6 * self.K, config.d_model))
-
-        # 2. Divide into 3 segments of 2N each.
+        # Updated positional embeddings:
+        # For antenna-level tokens: there are 6N tokens, divide into 3 segments of 2N each.
         self.pos_emb_ant_H = nn.Parameter(th.zeros(2 * self.N, config.d_model))  # for H_real/H_imag
         self.pos_emb_ant_W = nn.Parameter(th.zeros(2 * self.N, config.d_model))  # for W_real/W_imag
         self.pos_emb_ant_P = nn.Parameter(th.zeros(2 * self.N, config.d_model))  # for P_real/P_imag
@@ -198,10 +192,6 @@ class BeamformingTransformer(nn.Module):
         # Project tokens into d_model and add positional embeddings.
         tokens_ant_proj = self.ant_proj(tokens_ant)  # (B, 6N, d_model)
 
-        # # 1. when position embedding is added equally
-        # tokens_ant_proj = tokens_ant_proj + self.pos_emb_ant.unsqueeze(0) # (B, 6N, d_model)
-
-        # 2. when position embedding is added separately
         H_part_ant = tokens_ant_proj[:, :2*self.N, :]
         W_part_ant = tokens_ant_proj[:, 2*self.N:4*self.N, :]
         P_part_ant = tokens_ant_proj[:, 4*self.N:6*self.N, :]
@@ -228,10 +218,6 @@ class BeamformingTransformer(nn.Module):
         # Project tokens into d_model and add positional embeddings.
         tokens_user_proj = self.user_proj(tokens_user)  # (B, 6N, d_model)
 
-        # # 1. when position embedding is added equally
-        # tokens_user_proj = tokens_user_proj + self.pos_emb_user.unsqueeze(0)
-
-        # 2. when position embedding is added separately
         H_part_user = tokens_user_proj[:, :2*self.K, :]
         W_part_user = tokens_user_proj[:, 2*self.K:4*self.K, :]
         P_part_user = tokens_user_proj[:, 4*self.K:6*self.K, :]
@@ -316,9 +302,11 @@ def configure_optimizer(model, learning_rate, weight_decay):
 #############################################
 # Training Routine (unchanged)
 #############################################
-def train_beamforming_transformer(config):
+def train_beamforming_transformer(config, pretrained_path: str = None):
     """
     Train the beamforming transformer based on the given configuration.
+    If `pretrained_path` is provided, load those weights before training.
+    Returns the path where the final model was saved.
     """
     dataset = ChannelDataset(num_samples=config.pbar_size * config.batch_size,
                              num_users=config.num_users,
@@ -328,12 +316,21 @@ def train_beamforming_transformer(config):
     dataloader = DataLoader(dataset, batch_size=config.batch_size, shuffle=True)
     
     device = th.device("cuda" if th.cuda.is_available() else "cpu")
+
+    # 1) Instantiate the model
     model = BeamformingTransformer(config).to(device)
+
+    # 2) Optionally load pretrained weights
+    if pretrained_path is not None:
+        checkpoint = th.load(pretrained_path, map_location=device)
+        model.load_state_dict(checkpoint['model_state_dict'])
+        print(f"Loaded pretrained weights from {pretrained_path}")
+    
     optimizer = configure_optimizer(model, config.learning_rate, config.weight_decay)
 
     # Learning rate scheduler that linearly decays lr.
     scheduler = th.optim.lr_scheduler.LambdaLR(
-        optimizer, lambda epoch: 1 - 0.3 * (epoch / config.max_epoch)
+        optimizer, lambda epoch: 1 - 0.1 * (epoch / config.max_epoch)
     )
     
     global mmse_rate_printed
@@ -436,7 +433,7 @@ def train_beamforming_transformer(config):
     os.makedirs(save_dir, exist_ok=True)
     
     # Save the model with configuration info in the filename
-    model_filename = f"transformer_model_{config.num_users}_{config.num_tx}_d_{config.d_model}_T_{config.T}_self_attn.pt"
+    model_filename = f"transformer_model_{config.num_users}_{config.num_tx}_d_{config.d_model}_T_{config.T}_self_attn_stage_{config.checknum}.pt"
     model_path = os.path.join(save_dir, model_filename)
     
     # Save both model state dict and full model
@@ -449,20 +446,23 @@ def train_beamforming_transformer(config):
     
     print(f"Model saved to {model_path}")
 
-    # Create x-axis values for both plots.
-    x_rate_history = th.arange(len(rate_history))
-    x_test_rate_history = th.arange(len(test_rate_history)) * config.pbar_size
+    return model_path
 
-    plt.figure(figsize=(10, 6))
-    plt.plot(x_rate_history, rate_history, marker='.', linestyle='-', color='b', label='Training Rate')
-    plt.plot(x_test_rate_history, ave_rate_history, marker='*', linestyle='-', color='g', label='Average Rate')
-    plt.plot(x_test_rate_history, test_rate_history, marker='o', linestyle='-', color='r', label='Testing Rate')
-    plt.title(f"Training and Testing Rate when N={config.num_tx} and N={config.num_users}")
-    plt.legend()
-    plt.xlabel("Epochs")
-    plt.ylabel("Sum Rate")
-    plt.grid(True, which="both", ls="--")
-    plt.show()
+
+    # # Create x-axis values for both plots.
+    # x_rate_history = th.arange(len(rate_history))
+    # x_test_rate_history = th.arange(len(test_rate_history)) * config.pbar_size
+
+    # plt.figure(figsize=(10, 6))
+    # plt.plot(x_rate_history, rate_history, marker='.', linestyle='-', color='b', label='Training Rate')
+    # plt.plot(x_test_rate_history, ave_rate_history, marker='*', linestyle='-', color='g', label='Average Rate')
+    # plt.plot(x_test_rate_history, test_rate_history, marker='o', linestyle='-', color='r', label='Testing Rate')
+    # plt.title(f"Training and Testing Rate when N={config.num_tx} and N={config.num_users}")
+    # plt.legend()
+    # plt.xlabel("Epochs")
+    # plt.ylabel("Sum Rate")
+    # plt.grid(True, which="both", ls="--")
+    # plt.show()
 
 #############################################
 # Config Class (unchanged)
@@ -487,53 +487,60 @@ class BeamformerTransformerConfig:
         self.mlp_ratio = kwargs['mlp_ratio']
         self.subspace_dim = kwargs['subspace_dim']
         self.pbar_size = kwargs['pbar_size']
+        self.checknum = kwargs['checknum'] 
 
 #############################################
 # Main entry point.
 #############################################
 if __name__ == "__main__":
-    # Example configuration where num_users = num_tx = 8.
-    num_users = 16
-    num_tx = 16
-    d_model = 256          # Transformer token dimension
-    beam_dim = 2 * num_tx * num_users  # Beamformer vector dimension
-    n_head = 8
-    n_layers = 6
-    T = 1
-    batch_size = 256 
-    learning_rate = 1e-4
-    weight_decay = 0.05
-    max_epoch = 400
-    sigma2 = 1.0  
-    SNR = 15
-    SNR_power = 10 ** (SNR / 10)
-    attn_pdrop = 0.0
-    resid_pdrop = 0.0
-    mlp_ratio = 4
-    subspace_dim = 4
-    pbar_size = 1000
-    
-    # Create configuration object.
+
     config = BeamformerTransformerConfig(
-        d_model=d_model,
-        beam_dim=beam_dim,
-        n_head=n_head,
-        n_layers=n_layers,
-        batch_size=batch_size,
-        learning_rate=learning_rate,
-        weight_decay=weight_decay,
-        max_epoch=max_epoch,
-        num_users=num_users,
-        num_tx=num_tx,
-        sigma2=sigma2,
-        T=T,
-        SNR_power=SNR_power,
-        attn_pdrop=attn_pdrop,
-        resid_pdrop=resid_pdrop,
-        mlp_ratio=mlp_ratio,
-        subspace_dim=subspace_dim,
-        pbar_size=pbar_size
+        d_model=256,          # Transformer token dimension
+        beam_dim=2 * 16 * 16,  # Beamformer vector dimension (2 * num_tx * num_users)
+        n_head=8,
+        n_layers=6,
+        batch_size=256, 
+        learning_rate=5e-4,
+        weight_decay=0.05,
+        max_epoch=100,
+        num_users=16,
+        num_tx=16,
+        sigma2=1.0,
+        T=1,
+        SNR_power=10 ** (15 / 10),  # 15dB SNR
+        attn_pdrop=0.0,
+        resid_pdrop=0.0,
+        mlp_ratio=4,
+        subspace_dim=4,
+        pbar_size=500,
+        checknum=1  
     )
-    
+
+    config_2 = BeamformerTransformerConfig(
+        d_model=256,          # Transformer token dimension
+        beam_dim=2 * 16 * 16,  # Beamformer vector dimension (2 * num_tx * num_users)
+        n_head=8,
+        n_layers=6,
+        batch_size=256, 
+        learning_rate=5e-5,
+        weight_decay=0.05,
+        max_epoch=300,
+        num_users=16,
+        num_tx=16,
+        sigma2=1.0,
+        T=5,
+        SNR_power=10 ** (15 / 10),  # 15dB SNR
+        attn_pdrop=0.0,
+        resid_pdrop=0.0,
+        mlp_ratio=4,
+        subspace_dim=4,
+        pbar_size=500,
+        checknum=2
+    )
+        
     # Train the beamforming transformer.
-    train_beamforming_transformer(config)
+    model_path_stage_1 = train_beamforming_transformer(config)
+
+    model_path_stage2 = train_beamforming_transformer(config_2, pretrained_path=model_path_stage_1)
+
+
