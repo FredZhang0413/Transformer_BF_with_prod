@@ -1,0 +1,14 @@
+1. Since STO and CFO are part of the information
+for communication channels, unlike usual sensing procedures,
+sensing-assisted communication channel estimation needs to
+use the sensing information before STO and CFO calibrations.
+
+2. expand of explanation； 
+
+To improve the Doppler resolution, the sensing
+algorithm executed in the current slot can reuse the DMRSs
+in the past S slots, if the total duration is within the radar CPI.
+
+3. Can you elaborate more on this update rule, is it based on the pre-defined DMRS?
+"The update check module will determine whether to update the LMMSE coefficients or not. 
+If yes, ... will be updated with sensing results in the current slot."
