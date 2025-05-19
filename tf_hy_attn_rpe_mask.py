@@ -85,6 +85,164 @@ def compute_mmse_beamformer(mat_H, K, N, P, noise_power=1, device=th.device("cud
     SINR = S/(I+N)
     return mat_W, th.log2(1+SINR).sum(dim=-1).unsqueeze(-1)
 
+
+#############################################
+# 2. Mask generation helper
+#############################################
+def generate_batch_masks(H_mat, activated_degree):
+    """
+    For each sample in H_mat (B,K,N), generate:
+      - H_mask: masked channel (B,K,N)
+      - W_mask: masked beamformer placeholders (B,K,N)
+      - P_mask: masked product placeholders (B,K,K)
+      - user_attn_mask: token-level mask for user-level attention (B,2K,2K)
+      - antenna_attn_mask: token-level mask for antenna-level attention (B,2N,2N)
+    """
+    B, K, N = H_mat.shape
+    H_mask = th.zeros_like(H_mat) # initialized to zero
+    W_mask = th.zeros_like(H_mat)
+    P_mask = th.zeros((B, K, K), dtype=th.cfloat, device=device)
+
+    i_idx = th.randperm(K, device=device)[:activated_degree]
+    j_idx = th.randperm(N, device=device)[:activated_degree]
+
+    M = th.zeros((K, N), device=device)
+    ii, jj = th.meshgrid(i_idx, j_idx, indexing='ij')
+    M[ii, jj] = 1.0
+    M_out = M.unsqueeze(0).expand(B, -1, -1)  # (B, K, N)
+
+    H_mask = H_mat * M.unsqueeze(0)
+    H_act = H_mask[:, i_idx][:, :, j_idx] # (B, m, m)
+
+    W_act, _ = compute_mmse_beamformer(H_act, activated_degree, activated_degree, P=1.0, noise_power=1, device=device)  # (B, m, m)
+    # W_act = W_act_full.transpose(1, 2)  # (B, m, m)
+    batch_indices = th.arange(B, device=device).view(-1, 1, 1) ## (B, 1, 1)
+    batch_indices = batch_indices.expand(-1, activated_degree, activated_degree) ## (B, m, m)
+    user_indices = i_idx.view(1, -1, 1).expand(B, -1, activated_degree)
+    ant_indices = j_idx.view(1, 1, -1).expand(B, activated_degree, -1)
+    W_mask[batch_indices, user_indices, ant_indices] = W_act
+
+    P_act = th.bmm(H_act, W_act.transpose(1, 2)) 
+    user_i_indices = i_idx.view(1, -1, 1).expand(B, -1, activated_degree)
+    user_j_indices = i_idx.view(1, 1, -1).expand(B, activated_degree, -1)
+    P_mask[batch_indices, user_i_indices, user_j_indices] = P_act
+
+    mask_u = th.zeros((2*K, 2*K), device=device)
+    ui_indices = i_idx.unsqueeze(1).repeat(1, activated_degree)  # [m, m]
+    uj_indices = i_idx.unsqueeze(0).repeat(activated_degree, 1)  # [m, m]
+    ru_offsets = th.tensor([0, 0, 1, 1], device=device)
+    su_offsets = th.tensor([0, 1, 0, 1], device=device)
+    ui_flat = ui_indices.flatten().unsqueeze(1).repeat(1, 4)  # [m*m, 4]
+    uj_flat = uj_indices.flatten().unsqueeze(1).repeat(1, 4)  # [m*m, 4]
+    rows_u = (2 * ui_flat + ru_offsets).flatten()  # [m*m*4]
+    cols_u = (2 * uj_flat + su_offsets).flatten()  # [m*m*4]
+    mask_u[rows_u, cols_u] = 1.0
+
+    mask_a = th.zeros((2*N, 2*N), device=device)
+    ai_indices = j_idx.unsqueeze(1).repeat(1, activated_degree)  # [m, m]
+    aj_indices = j_idx.unsqueeze(0).repeat(activated_degree, 1)  # [m, m]
+    ra_offsets = th.tensor([0, 0, 1, 1], device=device)
+    sa_offsets = th.tensor([0, 1, 0, 1], device=device)
+    ai_flat = ai_indices.flatten().unsqueeze(1).repeat(1, 4)  # [m*m, 4]
+    aj_flat = aj_indices.flatten().unsqueeze(1).repeat(1, 4)  # [m*m, 4]
+    rows_a = (2 * ai_flat + ra_offsets).flatten()  # [m*m*4]
+    cols_a = (2 * aj_flat + sa_offsets).flatten()  # [m*m*4]
+    mask_a[rows_a, cols_a] = 1.0
+
+    user_attn_mask = mask_u.unsqueeze(0).expand(B, -1, -1)  # (B, 2K, 2K)
+    antenna_attn_mask = mask_a.unsqueeze(0).expand(B, -1, -1)  # (B, 2N, 2N)
+
+    ### do not use batch parallelism
+    # user_masks = [] 
+    # ant_masks = []
+
+    # for b in range(B):
+    #     # 1) randomly select activated users and antennas
+    #     i_idx = th.randperm(K, device=device)[:activated_degree]
+    #     j_idx = th.randperm(N, device=device)[:activated_degree]
+
+    #     # 2) build input mask M (K x N)
+    #     M = th.zeros((K, N), device=device)
+    #     # set M[i*, j*] = 1 for all combinations
+    #     ii, jj = th.meshgrid(i_idx, j_idx, indexing='ij')
+    #     M[ii, jj] = 1.0
+
+    #     # 3) masked channel
+    #     Hb = H_mat[b]  # (K, N) complex
+    #     H_mask[b] = Hb * M
+
+    #     # 4) extract activated submatrix H_act (m x m)
+    #     H_act = H_mask[b][i_idx][:, j_idx].unsqueeze(0)  # (1, m, m)
+
+    #     # 5) compute MMSE on H_act
+    #     W_act_full = compute_mmse_beamformer(H_act, activated_degree, activated_degree, P=1.0, noise_power=1, device=device)  # (1, m, m)
+    #     W_act = W_act_full.transpose(1,2)[0]  # (m, m) now (users, antennas)
+
+    #     # 6) build masked beamformer W_mask
+    #     # for ui, ai in enumerate(i_idx):
+    #     #     for aj, ak in enumerate(j_idx):
+    #     #         W_mask[b, ai, ak] = W_act[ui, aj]
+    #     W_mask[b, i_idx[:, None], j_idx[None, :]] = W_act
+    #     # w_norm = th.norm(W_mask[b], p='fro')  
+    #     # W_mask[b] = W_mask[b] / w_norm
+
+    #     # 7) compute masked product P_act = H_act @ W_act^T
+    #     P_act = th.matmul(H_act[0], W_act.transpose(0,1))  # (m, m)
+    #     # for ui, vi in enumerate(i_idx):
+    #     #     for uj, vj in enumerate(i_idx):
+    #     #         P_mask[b, vi, vj] = P_act[ui, uj]
+    #     P_mask[b, i_idx[:, None], i_idx[None, :]] = P_act
+
+    #     # 8) build token-level user attention mask (2K x 2K)
+    #     mask_u_small = th.zeros((K, K), device=device)
+    #     mask_u_small[i_idx[:,None], i_idx[None,:]] = 1.0 ## original user_level     
+    #     mask_u = th.zeros((2*K, 2*K), device=device) ## initialize final masking code
+    #     ui_indices = i_idx.unsqueeze(1).repeat(1, activated_degree)  # [m, m]
+    #     uj_indices = i_idx.unsqueeze(0).repeat(activated_degree, 1)  # [m, m]
+    #     ru_offsets = th.tensor([0, 0, 1, 1], device=device)
+    #     su_offsets = th.tensor([0, 1, 0, 1], device=device)
+    #     ui_flat = ui_indices.flatten().unsqueeze(1).repeat(1, 4)  # [m*m, 4]
+    #     uj_flat = uj_indices.flatten().unsqueeze(1).repeat(1, 4)  # [m*m, 4]
+    #     rows_u = (2 * ui_flat + ru_offsets).flatten()  # [m*m*4]
+    #     cols_u = (2 * uj_flat + su_offsets).flatten()  # [m*m*4]
+    #     mask_u[rows_u, cols_u] = 1.0
+    #     user_masks.append(mask_u)
+    #     # for p in range(activated_degree):
+    #     #     for q in range(activated_degree):
+    #     #         ui, uj = i_idx[p].item(), i_idx[q].item()
+    #     #         for r in (0,1):
+    #     #             for s in (0,1):
+    #     #                 mask_u[2*ui+r, 2*uj+s] = 1.0
+    #     # user_masks.append(mask_u)
+
+    #     # 9) build token-level antenna attention mask (2N x 2N)
+    #     mask_a_small = th.zeros((N, N), device=device)
+    #     mask_a_small[j_idx[:,None], j_idx[None,:]] = 1.0
+    #     mask_a = th.zeros((2*N, 2*N), device=device)
+    #     ai_indices = j_idx.unsqueeze(1).repeat(1, activated_degree)  # [m, m]
+    #     aj_indices = j_idx.unsqueeze(0).repeat(activated_degree, 1)  # [m, m]
+    #     ra_offsets = th.tensor([0, 0, 1, 1], device=device)
+    #     sa_offsets = th.tensor([0, 1, 0, 1], device=device)
+    #     ai_flat = ai_indices.flatten().unsqueeze(1).repeat(1, 4)  # [m*m, 4]
+    #     aj_flat = aj_indices.flatten().unsqueeze(1).repeat(1, 4)  # [m*m, 4]
+    #     rows_a = (2 * ai_flat + ra_offsets).flatten()  # [m*m*4]
+    #     cols_a = (2 * aj_flat + sa_offsets).flatten()  # [m*m*4]
+    #     mask_a[rows_a, cols_a] = 1.0
+    #     # for p in range(activated_degree):
+    #     #     for q in range(activated_degree):
+    #     #         ai, aj = j_idx[p].item(), j_idx[q].item()
+    #     #         for r in (0,1):
+    #     #             for s in (0,1):
+    #     #                 mask_a[2*ai+r, 2*aj+s] = 1.0
+    #     ant_masks.append(mask_a)
+
+    # user_attn_mask = th.stack(user_masks, dim=0)           # (B,2K,2K)
+    # antenna_attn_mask = th.stack(ant_masks, dim=0)        # (B,2N,2N)
+    
+    return H_mask, W_mask, P_mask, H_act, W_act, P_act, user_attn_mask, antenna_attn_mask, M_out
+
+
+
 #############################################
 # Modified Cross-Attention Block supporting separate Query, Key, and Value.
 #############################################
@@ -148,7 +306,7 @@ class CrossAttentionBlock(nn.Module):
         rel_pos_bias = self.rel_pos_bias[:, rel_pos_index]
         return rel_pos_bias
     
-    def forward(self, query, key, value):
+    def forward(self, query, key, value, attn_mask=None, self_attn_mask=None):
         """
         Performs cross-attention using separate Query, Key, and Value inputs.
         
@@ -179,6 +337,10 @@ class CrossAttentionBlock(nn.Module):
         cross_bias = self.cross_attn_bias[:, :L_q, :L_k] ## deal with variant lengths
         att = att + cross_bias.unsqueeze(0)  # (B, n_head, L_q, L_k)
 
+        if attn_mask is not None:
+            mask = attn_mask.unsqueeze(1)  # (B,1,L_q,L_k)
+            att = att.masked_fill(mask == 0, float('-1e9'))
+
         att = F.softmax(att, dim=-1)
         att = self.attn_drop(att)
         
@@ -206,6 +368,11 @@ class CrossAttentionBlock(nn.Module):
         rel_pos_bias = self._get_rel_pos_bias(L_q, L_q)
         rel_pos_bias = rel_pos_bias.unsqueeze(0)
         att_s = att_s + rel_pos_bias
+
+        # apply self-attention mask if provided
+        if self_attn_mask is not None:
+            mask_s = self_attn_mask.unsqueeze(1)
+            att_s = att_s.masked_fill(mask_s == 0, float('-1e9'))
 
         att_s = F.softmax(att_s, dim=-1)
         att_s = self.attn_drop(att_s)
@@ -315,7 +482,7 @@ class BeamformingTransformer(nn.Module):
         elif isinstance(module, nn.Embedding):
             nn.init.normal_(module.weight, mean=0.0, std=0.02)
     
-    def forward(self, H, W_prev):
+    def forward(self, H, W_prev, P_mask, user_attn_mask=None, antenna_attn_mask=None, input_mask = None):
         """
         Args:
             H: Complex channel matrix, shape (B, num_users, num_tx) (i.e. (B, K, N)).
@@ -326,13 +493,7 @@ class BeamformingTransformer(nn.Module):
         B = H.size(0)
         K = self.K  # Number of users
         N = self.N  # Number of transmit antennas
-        
-        # ---------------------------
-        # Compute the product: Prod = H * (W_prev^T).
-        # H and W_prev are complex with shape (B, K, N); W_prev^T has shape (B, N, K), so Prod is (B, K, K).
-        # ---------------------------
-        Prod = th.bmm(H, W_prev.transpose(-1, -2))  # (B, K, K)
-        
+             
         # ---------------------------
         # 1. Antenna-level Cross-Attention
         #    - Query tokens from H (column-wise tokens).
@@ -340,29 +501,20 @@ class BeamformingTransformer(nn.Module):
         #    - Value tokens from Prod are obtained column-wise.
         # ---------------------------
         # Create antenna-level tokens.
-        H_ant = th.cat([H.real.transpose(1,2), H.imag.transpose(1,2)], dim=1)    # (B, 2*N, K)
-        W_ant = th.cat([W_prev.real.transpose(1,2), W_prev.imag.transpose(1,2)], dim=1)  # (B, 2*N, K)
+        # Antenna-level: tokens from columns
+        H_ant = th.cat([H.real.transpose(1,2), H.imag.transpose(1,2)], dim=1)    # (B,2N,K)
+        W_ant = th.cat([W_prev.real.transpose(1,2), W_prev.imag.transpose(1,2)], dim=1)  # (B,2N,K)
+        P_ant = th.cat([P_mask.real.transpose(1,2), P_mask.imag.transpose(1,2)], dim=1)  # (B,2K,K)
         
         # Project Query and Key tokens.
         H_ant_proj = self.antenna_channel_proj(H_ant)  # (B, 2*N, d_model)
         W_ant_proj = self.antenna_beam_proj(W_ant)       # (B, 2*N, d_model)
-        
-        # Create Value tokens:
-        # Each column of Prod is used as an antenna-level token.
-        P_ant = th.cat([Prod.real.transpose(1,2), Prod.imag.transpose(1,2)], dim=1)  # (B, 2*K, K)
-        # Project V_ant to the desired dimension.
         P_ant_proj = self.antenna_prod_proj(P_ant)  # (B, 2*K, d_model)
-
-        # # Add positional embedding to Value tokens (antenna-level).
-        # P_ant_proj = P_ant_proj + self.pos_emb_ant_P.unsqueeze(0)
-        # H_ant_proj = H_ant_proj + self.pos_emb_ant_H.unsqueeze(0)
-        # W_ant_proj = W_ant_proj + self.pos_emb_ant_W.unsqueeze(0)
         
         # Multi-layer Cross-attention blocks for antenna-level
-        # x_a = self.cross_attn_ant(H_ant_proj, W_ant_proj, P_ant_proj)  # (B, 2*N, d_model)
         x_a = H_ant_proj
         for layer in self.ant_mhca_layers:
-            x_a = layer(x_a, W_ant_proj, P_ant_proj)  
+            x_a = layer(x_a, W_ant_proj, P_ant_proj, attn_mask =antenna_attn_mask, self_attn_mask=antenna_attn_mask)  
         x_a_final = x_a
 
         # ---------------------------
@@ -371,29 +523,20 @@ class BeamformingTransformer(nn.Module):
         #    - Key tokens from W_prev (row-wise tokens).
         #    - Value tokens from Prod are obtained row-wise.
         # ---------------------------
-        H_user = th.cat([H.real, H.imag], dim=1)  # (B, 2*K, N)
-        W_user = th.cat([W_prev.real, W_prev.imag], dim=1)  # (B, 2*K, N)
+        H_user = th.cat([H.real, H.imag], dim=1)    # (B,2K,N)
+        W_user = th.cat([W_prev.real, W_prev.imag], dim=1)  # (B,2K,N)
+        P_user = th.cat([P_mask.real, P_mask.imag], dim=1)  # (B,2K,K)
         
         # Project Query and Key tokens.
-        H_user_proj = self.user_channel_proj(H_user)  # (B, 2*K, d_model)
-        W_user_proj = self.user_beam_proj(W_user)       # (B, 2*K, d_model)
-        
-        # Create Value tokens:
-        # Each row of Prod is used as a user-level token.
-        P_user = th.cat([Prod.real, Prod.imag], dim=1)  # (B, 2*K, K)
-        # Project V_user to the desired dimension.
-        P_user_proj = self.user_prod_proj(P_user)  # (B, 2*K, d_model)
-
-        # # Add positional embedding to Value tokens (user-level).
-        # P_user_proj = P_user_proj + self.pos_emb_user_P.unsqueeze(0)
-        # H_user_proj = H_user_proj + self.pos_emb_user_H.unsqueeze(0)
-        # W_user_proj = W_user_proj + self.pos_emb_user_W.unsqueeze(0)
+        H_user_proj = self.user_channel_proj(H_user)
+        W_user_proj = self.user_beam_proj(W_user)
+        P_user_proj = self.user_prod_proj(P_user)
         
         # Cross-attention for user-level.
         # x_u = self.cross_attn_user(H_user_proj, W_user_proj, P_user_proj)  # (B, 2*K, d_model)
         x_u = H_user_proj # (B, 2*K, d_model)
         for layer in self.user_mhca_layers:
-            x_u = layer(x_u, W_user_proj, P_user_proj)
+            x_u = layer(x_u, W_user_proj, P_user_proj, attn_mask = user_attn_mask, self_attn_mask=user_attn_mask)
         x_u_final = x_u
 
         # ---------------------------
@@ -405,9 +548,17 @@ class BeamformingTransformer(nn.Module):
         x_fused = th.cat([x_a_flat, x_u_flat], dim=-1)  # (B, (2*N+2*K)*d_model)
         
         # Project fused features to final beamformer vector and normalize.
-        W_next = self.out_proj(x_fused)  # (B, beam_dim)
-        norm = th.norm(W_next, dim=1, keepdim=True)
-        W_next = W_next / norm
+        W_next_vec = self.out_proj(x_fused)  # (B, beam_dim)
+        W_real = W_next_vec[:, :config.num_users * config.num_tx].reshape(-1, config.num_users, config.num_tx)
+        W_imag = W_next_vec[:, config.num_users * config.num_tx:].reshape(-1, config.num_users, config.num_tx)
+        W_complex = W_real + 1j * W_imag
+        if input_mask is not None:
+            W_complex = W_complex * input_mask ## Hardamard product
+        W_norm = th.sqrt((W_complex.conj() * W_complex).sum(dim=(-2, -1)).real)
+        W_normalized = W_complex / W_norm.view(-1, 1, 1)
+        W_next = W_normalized.transpose(-1, -2)  # (B, num_tx, num_users)
+        # norm = th.norm(W_next, dim=1, keepdim=True)
+        # W_next = W_next / norm
         return W_next
 
 #############################################
@@ -567,12 +718,15 @@ def train_beamforming_transformer(config, pretrained_path: str = None, history_p
     # test_rate_history = []
     # ave_rate_history = []
 
-    save_dir = f"{config.num_users}_{config.num_tx}_hybrid_attn_multi_layer"
+    save_dir = f"{config.num_users}_{config.num_tx}_rpe_mask"
     os.makedirs(save_dir, exist_ok=True)
     best_model_path = os.path.join(save_dir, "best_model.pt")
     
     for epoch in range(start_epoch_prev, config.max_epoch):
 
+        activated_degree = min(config.num_users, config.start_degree + (epoch // config.degree_epoch))  # Gradually increase the number of activated users.
+        incre_epoch = config.degree_epoch * (config.num_users - config.start_degree)
+        scale_weight = 2000 * (activated_degree - config.start_degree + 1) 
         # cosine decay teacher weight.
         # if epoch < 200:
         #     teacher_weight = 0.9
@@ -584,7 +738,7 @@ def train_beamforming_transformer(config, pretrained_path: str = None, history_p
         #     teacher_weight = 0.0
 
         # # Soft switch learning policy.
-        teacher_weight = max(0.1, 1 - (epoch / 100))
+        teacher_weight = max(0.1, 1 - (epoch / incre_epoch))
         # teacher_weight = 0.0  
 
         epoch_loss = 0
@@ -601,48 +755,44 @@ def train_beamforming_transformer(config, pretrained_path: str = None, history_p
             # batch_size = H_tensor.size(0)
             # Convert to complex channel matrix: (B, num_users, num_tx)
             H_mat = H_tensor[:, 0, :, :] + 1j * H_tensor[:, 1, :, :]
+
+            # generate masked inputs and attention masks
+            H_mask, W_mask, P_mask, H_act, W_act, P_act, user_attn_mask, antenna_attn_mask, M_out = generate_batch_masks(H_mat, activated_degree)
+            # print(f"Masked H: {H_mask[0]}")
+            # print(f"Masked W: {W_mask[0]}")
+
+            # predict next beamformer from masked inputs
+            W_next = model(H_mask, W_mask, P_mask, user_attn_mask=user_attn_mask, antenna_attn_mask=antenna_attn_mask, input_mask=M_out)
+            # print(f"Predicted W: {W_next[0]}")
+            # bp()
+            # W_mat = (W_next[:, :config.num_tx * config.num_users].reshape(-1, config.num_tx, config.num_users) + 1j * W_next[:, config.num_tx * config.num_users:].reshape(-1, config.num_tx, config.num_users))
+            # total_rate = sum_rate(H_mat, W_mat, sigma2=config.sigma2)
+            total_rate = sum_rate(H_mask, W_next, sigma2=config.sigma2)
+
+            # W_act = W_act.transpose(-1, -2)  # (B, num_tx, num_users)
+            # rate_test = sum_rate(H_act, W_act, sigma2=config.sigma2)
+            # print(f"MMSE Rate: {rate_test:.4f}")
+            # bp()
+            W_mask = W_mask.transpose(-1, -2)  # (B, num_tx, num_users)
+            # rate_test = sum_rate(H_mask, W_mask, sigma2=config.sigma2)
+            # print(f"MMSE Rate: {rate_test:.4f}")
+            # bp()
             
-            # Compute initial beamformer using MMSE.
-            W0, _ = compute_mmse_beamformer(H_mat, config.num_users, config.num_tx, config.SNR_power, config.sigma2, device)
-            W0 = W0.transpose(-1, -2).to(device)  # (B, num_tx, num_users)
-            vec_w0 = th.cat((th.real(W0).reshape(-1, config.num_tx * config.num_users), th.imag(W0).reshape(-1, config.num_tx * config.num_users)), dim=-1)
+            vec_w0 = th.cat((th.real(W_mask).reshape(-1, config.num_tx * config.num_users), th.imag(W_mask).reshape(-1, config.num_tx * config.num_users)), dim=-1)
             vec_w0 = vec_w0.reshape(-1, 2 * config.num_tx * config.num_users)
             norm_W0 = th.norm(vec_w0, dim=1, keepdim=True)
-            normlized_W0 = vec_w0 / norm_W0
-            # Reconstruct complex beamformer: (B, num_tx, num_users)
-            W_mat_0 = (normlized_W0[:, :config.num_tx * config.num_users].reshape(-1, config.num_tx, config.num_users) + 1j * normlized_W0[:, config.num_tx * config.num_users:].reshape(-1, config.num_tx, config.num_users))
-            rate_0 = sum_rate(H_mat, W_mat_0, sigma2=config.sigma2)
-            if not mmse_rate_printed:
-                mmse_rate_printed = True
-                print(f"MMSE Rate: {rate_0.item():.4f}")
-            
-            # Initialize W_prev (transpose to get shape (B, num_users, num_tx)).
-            W_prev = W_mat_0.transpose(-1, -2).to(device)
-            total_rate = 0
-            total_mse_loss = 0
-            for t in range(1, config.T + 1):
-                # The model predicts the next beamformer.
-                W_next = model(H_mat, W_prev)  # (B, beam_dim)
-                # Convert W_next to complex beamformer matrix: (B, num_tx, num_users)
-                W_mat = (W_next[:, :config.num_tx * config.num_users].reshape(-1, config.num_tx, config.num_users) + 1j * W_next[:, config.num_tx * config.num_users:].reshape(-1, config.num_tx, config.num_users))
-                W_prev = W_mat.transpose(-1, -2).to(device)  # (B, num_users, num_tx)
-                rate = sum_rate(H_mat, W_mat, sigma2=config.sigma2)
-                total_rate += rate
+            normlized_W0 = vec_w0 / norm_W0 
 
-                ### supervised MSE loss
-                mse_loss = fun.mse_loss(W_next, normlized_W0)
-                total_mse_loss += mse_loss
+            vec_w_next = th.cat((th.real(W_next).reshape(-1, config.num_tx * config.num_users), th.imag(W_next).reshape(-1, config.num_tx * config.num_users)), dim=-1)
+            vec_w_next = vec_w_next.reshape(-1, 2 * config.num_tx * config.num_users)
 
-                # ### unsupervised MSE loss
-                # mse_loss = get_mmse_obj(H_mat, W_mat, sigma2=config.sigma2)   
-                # total_mse_loss += mse_loss.mean()            
-                
-            
-            loss_unsupervised = - total_rate / config.T
-            loss_supervised = total_mse_loss / config.T
-            loss = (1 - teacher_weight) * loss_unsupervised + (teacher_weight * 30000) * loss_supervised ## supervised MSE
+            total_mse_loss = fun.mse_loss(vec_w_next, normlized_W0)
+          
+            loss_unsupervised = - total_rate
+            loss_supervised = total_mse_loss
+            loss = (1 - teacher_weight) * loss_unsupervised + (teacher_weight * scale_weight) * loss_supervised ## supervised MSE
             rs_loss_term = (1 - teacher_weight) * loss_unsupervised
-            mse_loss_term = (teacher_weight * 30000) * loss_supervised
+            mse_loss_term = (teacher_weight * scale_weight) * loss_supervised
             # print(loss_unsupervised.item(), 20000*loss_supervised.item())
             # bp()
             # loss = (1 - teacher_weight) * loss_unsupervised + (teacher_weight / 50) * loss_supervised ## supervised MSE
@@ -662,7 +812,7 @@ def train_beamforming_transformer(config, pretrained_path: str = None, history_p
             th.nn.utils.clip_grad_norm_(model.parameters(), max_norm=100.0)
             optimizer.step()
 
-            ave_rate = total_rate.item() / config.T
+            ave_rate = total_rate.item()
             epoch_loss += loss.item()
             epoch_rate += ave_rate
             epoch_sr_loss += rs_loss_term.item()
@@ -679,7 +829,7 @@ def train_beamforming_transformer(config, pretrained_path: str = None, history_p
         ave_mse_loss = epoch_mse_loss / pbar_batches
         ave_sr_loss = epoch_sr_loss / pbar_batches
         test_pbar_rate = max_rate
-        print(f"Epoch {epoch+1} Average Sum Rate: {ave_pbar_rate:.4f}, Learning Rate: {current_lr:.2e}, MSE Loss: {ave_mse_loss:.4f}, SR Loss: {ave_sr_loss:.4f}, Gradient Norm: {ave_grad_norm:.4f}")
+        print(f"Epoch {epoch+1} Average Sum Rate: {ave_pbar_rate:.4f}, Activated degree: {activated_degree:.2e}, MSE Loss: {ave_mse_loss:.4f}, SR Loss: {ave_sr_loss:.4f}, Gradient Norm: {ave_grad_norm:.4f}")
         ave_rate_history.append(th.tensor(ave_pbar_rate))
         test_rate_history.append(th.tensor(test_pbar_rate))
 
@@ -762,37 +912,39 @@ class BeamformerTransformerConfig:
         self.mlp_ratio = kwargs['mlp_ratio']
         self.subspace_dim = kwargs['subspace_dim']
         self.pbar_size = kwargs['pbar_size']
+        self.start_degree = kwargs['start_degree']
+        self.degree_epoch = kwargs['degree_epoch']
 
 if __name__ == "__main__":
 
-    # Example configuration where num_users = num_tx = 16.
-    num_users = 32
-    num_tx = 32  
-    beam_dim = 2*num_tx*num_users # Beamformer vector dimension
+    # # Example configuration where num_users = num_tx = 16.
+    # num_users = 32
+    # num_tx = 32  
+    # beam_dim = 2*num_tx*num_users # Beamformer vector dimension
 
-    # d_model = 384 # Transformer single-token dimension
-    # n_head = 12 # Number of attention heads
-    # n_layers = 4 # Number of transformer layers
+    # # d_model = 384 # Transformer single-token dimension
+    # # n_head = 12 # Number of attention heads
+    # # n_layers = 4 # Number of transformer layers
 
-    d_model = 448 # Transformer single-token dimension
-    n_head = 16 # Number of attention heads
-    n_layers = 5 # Number of transformer layers
+    # d_model = 448 # Transformer single-token dimension
+    # n_head = 16 # Number of attention heads
+    # n_layers = 5 # Number of transformer layers
 
-    T = 1 # Number of time steps
-    batch_size = 128 
-    learning_rate = 2e-4
-    weight_decay = 0.01
-    max_epoch = 1000
-    sigma2 = 1.0  
-    SNR = 15
-    SNR_power = 10 ** (SNR/10) # SNR power in dB
-    attn_pdrop = 0.0
-    # resid_pdrop = 0.05
+    # T = 1 # Number of time steps
+    # batch_size = 128 
+    # learning_rate = 2e-4
+    # weight_decay = 0.01
+    # max_epoch = 1000
+    # sigma2 = 1.0  
+    # SNR = 15
+    # SNR_power = 10 ** (SNR/10) # SNR power in dB
     # attn_pdrop = 0.0
-    resid_pdrop = 0.0
-    mlp_ratio = 4
-    subspace_dim = 4
-    pbar_size = 1000
+    # # resid_pdrop = 0.05
+    # # attn_pdrop = 0.0
+    # resid_pdrop = 0.0
+    # mlp_ratio = 4
+    # subspace_dim = 4
+    # pbar_size = 1000
 
     # # Example configuration where num_users = num_tx = 24.
     # num_users = 24
@@ -840,28 +992,30 @@ if __name__ == "__main__":
     # subspace_dim = 4
     # pbar_size = 1000
 
-    # # Example configuration where num_users = num_tx = 16.
-    # num_users = 16
-    # num_tx = 16
-    # d_model = 256 # Transformer single-token dimension
-    # beam_dim = 2*num_tx*num_users # Beamformer vector dimension
-    # n_head = 8 # Number of attention heads
-    # n_layers = 4 # Number of transformer layers
-    # T = 1 # Number of time steps
-    # batch_size = 128 
-    # learning_rate = 5e-4
-    # weight_decay = 0.01
-    # max_epoch = 1000
-    # sigma2 = 1.0  
-    # SNR = 15
-    # SNR_power = 10 ** (SNR/10) # SNR power in dB
+    # Example configuration where num_users = num_tx = 16.
+    num_users = 16
+    num_tx = 16
+    d_model = 256 # Transformer single-token dimension
+    beam_dim = 2*num_tx*num_users # Beamformer vector dimension
+    n_head = 8 # Number of attention heads
+    n_layers = 4 # Number of transformer layers
+    T = 1 # Number of time steps
+    batch_size = 128 
+    learning_rate = 5e-4
+    weight_decay = 0.01
+    max_epoch = 1000
+    sigma2 = 1.0  
+    SNR = 15
+    SNR_power = 10 ** (SNR/10) # SNR power in dB
+    attn_pdrop = 0.0
+    # resid_pdrop = 0.05
     # attn_pdrop = 0.0
-    # # resid_pdrop = 0.05
-    # # attn_pdrop = 0.0
-    # resid_pdrop = 0.0
-    # mlp_ratio = 4
-    # subspace_dim = 4
-    # pbar_size = 1000
+    resid_pdrop = 0.0
+    mlp_ratio = 4
+    subspace_dim = 4
+    pbar_size = 1000
+    start_degree = 4
+    degree_epoch = 30
 
     # Create configuration object.
     config = BeamformerTransformerConfig(
@@ -882,11 +1036,13 @@ if __name__ == "__main__":
         resid_pdrop=resid_pdrop,
         mlp_ratio=mlp_ratio,
         subspace_dim=subspace_dim,
-        pbar_size=pbar_size
+        pbar_size=pbar_size,
+        start_degree=start_degree,
+        degree_epoch=degree_epoch
     )
 
-    model_path_stage_1 = f"{config.num_users}_{config.num_tx}_hybrid_attn_multi_layer/best_model.pt"
-    history_path_stage_1 = f"{config.num_users}_{config.num_tx}_hybrid_attn_multi_layer/saved_history.pt"
+    model_path_stage_1 = f"{config.num_users}_{config.num_tx}_rpe_mask/best_model.pt"
+    history_path_stage_1 = f"{config.num_users}_{config.num_tx}_rpe_mask/saved_history.pt"
     
     ### Train the beamforming transformer.
     train_beamforming_transformer(config) ## first time training
