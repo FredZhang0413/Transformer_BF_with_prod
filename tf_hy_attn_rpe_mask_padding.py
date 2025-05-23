@@ -151,93 +151,6 @@ def generate_batch_masks(H_mat, activated_degree):
 
     user_attn_mask = mask_u.unsqueeze(0).expand(B, -1, -1)  # (B, 2K, 2K)
     antenna_attn_mask = mask_a.unsqueeze(0).expand(B, -1, -1)  # (B, 2N, 2N)
-
-    ### do not use batch parallelism
-    # user_masks = [] 
-    # ant_masks = []
-
-    # for b in range(B):
-    #     # 1) randomly select activated users and antennas
-    #     i_idx = th.randperm(K, device=device)[:activated_degree]
-    #     j_idx = th.randperm(N, device=device)[:activated_degree]
-
-    #     # 2) build input mask M (K x N)
-    #     M = th.zeros((K, N), device=device)
-    #     # set M[i*, j*] = 1 for all combinations
-    #     ii, jj = th.meshgrid(i_idx, j_idx, indexing='ij')
-    #     M[ii, jj] = 1.0
-
-    #     # 3) masked channel
-    #     Hb = H_mat[b]  # (K, N) complex
-    #     H_mask[b] = Hb * M
-
-    #     # 4) extract activated submatrix H_act (m x m)
-    #     H_act = H_mask[b][i_idx][:, j_idx].unsqueeze(0)  # (1, m, m)
-
-    #     # 5) compute MMSE on H_act
-    #     W_act_full = compute_mmse_beamformer(H_act, activated_degree, activated_degree, P=1.0, noise_power=1, device=device)  # (1, m, m)
-    #     W_act = W_act_full.transpose(1,2)[0]  # (m, m) now (users, antennas)
-
-    #     # 6) build masked beamformer W_mask
-    #     # for ui, ai in enumerate(i_idx):
-    #     #     for aj, ak in enumerate(j_idx):
-    #     #         W_mask[b, ai, ak] = W_act[ui, aj]
-    #     W_mask[b, i_idx[:, None], j_idx[None, :]] = W_act
-    #     # w_norm = th.norm(W_mask[b], p='fro')  
-    #     # W_mask[b] = W_mask[b] / w_norm
-
-    #     # 7) compute masked product P_act = H_act @ W_act^T
-    #     P_act = th.matmul(H_act[0], W_act.transpose(0,1))  # (m, m)
-    #     # for ui, vi in enumerate(i_idx):
-    #     #     for uj, vj in enumerate(i_idx):
-    #     #         P_mask[b, vi, vj] = P_act[ui, uj]
-    #     P_mask[b, i_idx[:, None], i_idx[None, :]] = P_act
-
-    #     # 8) build token-level user attention mask (2K x 2K)
-    #     mask_u_small = th.zeros((K, K), device=device)
-    #     mask_u_small[i_idx[:,None], i_idx[None,:]] = 1.0 ## original user_level     
-    #     mask_u = th.zeros((2*K, 2*K), device=device) ## initialize final masking code
-    #     ui_indices = i_idx.unsqueeze(1).repeat(1, activated_degree)  # [m, m]
-    #     uj_indices = i_idx.unsqueeze(0).repeat(activated_degree, 1)  # [m, m]
-    #     ru_offsets = th.tensor([0, 0, 1, 1], device=device)
-    #     su_offsets = th.tensor([0, 1, 0, 1], device=device)
-    #     ui_flat = ui_indices.flatten().unsqueeze(1).repeat(1, 4)  # [m*m, 4]
-    #     uj_flat = uj_indices.flatten().unsqueeze(1).repeat(1, 4)  # [m*m, 4]
-    #     rows_u = (2 * ui_flat + ru_offsets).flatten()  # [m*m*4]
-    #     cols_u = (2 * uj_flat + su_offsets).flatten()  # [m*m*4]
-    #     mask_u[rows_u, cols_u] = 1.0
-    #     user_masks.append(mask_u)
-    #     # for p in range(activated_degree):
-    #     #     for q in range(activated_degree):
-    #     #         ui, uj = i_idx[p].item(), i_idx[q].item()
-    #     #         for r in (0,1):
-    #     #             for s in (0,1):
-    #     #                 mask_u[2*ui+r, 2*uj+s] = 1.0
-    #     # user_masks.append(mask_u)
-
-    #     # 9) build token-level antenna attention mask (2N x 2N)
-    #     mask_a_small = th.zeros((N, N), device=device)
-    #     mask_a_small[j_idx[:,None], j_idx[None,:]] = 1.0
-    #     mask_a = th.zeros((2*N, 2*N), device=device)
-    #     ai_indices = j_idx.unsqueeze(1).repeat(1, activated_degree)  # [m, m]
-    #     aj_indices = j_idx.unsqueeze(0).repeat(activated_degree, 1)  # [m, m]
-    #     ra_offsets = th.tensor([0, 0, 1, 1], device=device)
-    #     sa_offsets = th.tensor([0, 1, 0, 1], device=device)
-    #     ai_flat = ai_indices.flatten().unsqueeze(1).repeat(1, 4)  # [m*m, 4]
-    #     aj_flat = aj_indices.flatten().unsqueeze(1).repeat(1, 4)  # [m*m, 4]
-    #     rows_a = (2 * ai_flat + ra_offsets).flatten()  # [m*m*4]
-    #     cols_a = (2 * aj_flat + sa_offsets).flatten()  # [m*m*4]
-    #     mask_a[rows_a, cols_a] = 1.0
-    #     # for p in range(activated_degree):
-    #     #     for q in range(activated_degree):
-    #     #         ai, aj = j_idx[p].item(), j_idx[q].item()
-    #     #         for r in (0,1):
-    #     #             for s in (0,1):
-    #     #                 mask_a[2*ai+r, 2*aj+s] = 1.0
-    #     ant_masks.append(mask_a)
-
-    # user_attn_mask = th.stack(user_masks, dim=0)           # (B,2K,2K)
-    # antenna_attn_mask = th.stack(ant_masks, dim=0)        # (B,2N,2N)
     
     return H_mask, W_mask, P_mask, H_act, W_act, P_act, user_attn_mask, antenna_attn_mask, M_out, i_idx, j_idx
 
@@ -661,7 +574,6 @@ def configure_optimizer(model, learning_rate, weight_decay):
     optimizer = th.optim.AdamW(optimizer_grouped_parameters, lr=learning_rate)
     return optimizer
 
-
 def lr_lambda(epoch, config):
     ## warm start
     total_steps = config.max_epoch
@@ -1025,7 +937,7 @@ if __name__ == "__main__":
     mlp_ratio = 4
     subspace_dim = 4
     pbar_size = 1000
-    start_degree = 8
+    start_degree = 4
     degree_epoch = 50
     degree_incre = 2
 
