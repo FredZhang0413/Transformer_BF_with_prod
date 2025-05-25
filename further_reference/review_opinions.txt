@@ -12,3 +12,6 @@ in the past S slots, if the total duration is within the radar CPI.
 3. Can you elaborate more on this update rule, is it based on the pre-defined DMRS?
 "The update check module will determine whether to update the LMMSE coefficients or not. 
 If yes, ... will be updated with sensing results in the current slot."
+
+4. You mentioned "Operating SNR = 10^5", what is the foundation of such a high SNR assumption?
+
