@@ -101,8 +101,10 @@ def generate_batch_masks(H_mat, activated_degree):
     W_mask = th.zeros_like(H_mat)
     P_mask = th.zeros((B, K, K), dtype=th.cfloat, device=device)
 
-    i_idx = th.randperm(K, device=device)[:activated_degree]
-    j_idx = th.randperm(N, device=device)[:activated_degree]
+    # i_idx = th.randperm(K, device=device)[:activated_degree]
+    # j_idx = th.randperm(N, device=device)[:activated_degree]
+    i_idx = th.sort(th.randperm(K, device=device)[:activated_degree])[0]
+    j_idx = th.sort(th.randperm(N, device=device)[:activated_degree])[0]
 
     M = th.zeros((K, N), device=device)
     ii, jj = th.meshgrid(i_idx, j_idx, indexing='ij')
@@ -217,7 +219,7 @@ class CrossAttentionBlock(nn.Module):
         rel_pos_bias = self.rel_pos_bias[:, rel_pos_index]
         return rel_pos_bias
     
-    def forward(self, query, key, value):
+    def forward(self, query, key, value, attn_mask):
         """
         Performs cross-attention using separate Query, Key, and Value inputs.
         
@@ -248,6 +250,10 @@ class CrossAttentionBlock(nn.Module):
         cross_bias = self.cross_attn_bias[:, :L_q, :L_k] ## deal with variant lengths
         att = att + cross_bias.unsqueeze(0)  # (B, n_head, L_q, L_k)
 
+        if attn_mask is not None:
+            mask = attn_mask.unsqueeze(1)  # (B,1,L_q,L_k)
+            att = att.masked_fill(mask == 0, float('-1e9'))
+
         att = F.softmax(att, dim=-1)
         att = self.attn_drop(att)
         
@@ -276,6 +282,10 @@ class CrossAttentionBlock(nn.Module):
         rel_pos_bias = rel_pos_bias.unsqueeze(0)
         att_s = att_s + rel_pos_bias
 
+        if attn_mask is not None:
+            mask_s = attn_mask.unsqueeze(1)  # (B,1,L_q,L_k)
+            att_s = att_s.masked_fill(mask == 0, float('-1e9'))
+
         att_s = F.softmax(att_s, dim=-1)
         att_s = self.attn_drop(att_s)
 
@@ -294,6 +304,39 @@ class CrossAttentionBlock(nn.Module):
         out_final = out_mlp + y_mlp  # Apply LayerNorm and MLP
         return out_final  # (B, L_q, d_model)
 
+
+class DynamicOutputProjection(nn.Module):
+    def __init__(self, input_dim, d_model):
+        super().__init__()
+        self.input_dim = input_dim
+        self.d_model = d_model
+        
+        self.base_layers = nn.Sequential(
+            nn.Linear(input_dim, 4 * d_model),
+            nn.LayerNorm(4 * d_model),
+            nn.GELU(),
+            nn.Linear(4 * d_model, 2 * d_model),
+            nn.LayerNorm(2 * d_model),
+            nn.GELU(),
+        )
+        self.output_layer = None
+        self.last_degree = None
+    
+    def forward(self, x, activated_degree):
+        x = self.base_layers(x)
+
+        ### if first time create or the degree is changed, create a new output layer and initialize it
+        if self.last_degree != activated_degree or self.output_layer is None:
+            out_dim = 2 * activated_degree * activated_degree  
+            self.output_layer = nn.Linear(2 * self.d_model, out_dim).to(device)
+            nn.init.normal_(self.output_layer.weight, mean=0.0, std=0.02)
+            nn.init.zeros_(self.output_layer.bias)
+            self.last_degree = activated_degree
+        
+        return self.output_layer(x)
+
+
+
 #############################################
 # Modified Beamforming Transformer for Complex Inputs with updated V computations.
 #############################################
@@ -303,8 +346,10 @@ class BeamformingTransformer(nn.Module):
         super(BeamformingTransformer, self).__init__()
         self.config = config
         # Set dimensions
-        self.K = config.num_users   # Number of users
-        self.N = config.num_tx      # Number of transmit antennas
+        self.K = config.num_users_outer   # Number of users
+        self.N = config.num_tx_outer      # Number of transmit antennas
+        # self.K = config.num_users   # Number of users
+        # self.N = config.num_tx      # Number of transmit antennas
 
         max_seq_len = max(2 * self.N, 2 * self.K) + 10  ## +10 as protective margin
         
@@ -372,7 +417,7 @@ class BeamformingTransformer(nn.Module):
         elif isinstance(module, nn.Embedding):
             nn.init.normal_(module.weight, mean=0.0, std=0.02)
     
-    def forward(self, H, W_prev):
+    def forward(self, H, W_prev, user_attn_mask, antenna_attn_mask):
         """
         Args:
             H: Complex channel matrix, shape (B, num_users, num_tx) (i.e. (B, K, N)).
@@ -410,7 +455,7 @@ class BeamformingTransformer(nn.Module):
         # x_a = self.cross_attn_ant(H_ant_proj, W_ant_proj, P_ant_proj)  # (B, 2*N, d_model)
         x_a = H_ant_proj
         for layer in self.ant_mhca_layers:
-            x_a = layer(x_a, W_ant_proj, P_ant_proj)  
+            x_a = layer(x_a, W_ant_proj, P_ant_proj, attn_mask=antenna_attn_mask)  
         x_a_final = x_a
 
         # ---------------------------
@@ -432,7 +477,7 @@ class BeamformingTransformer(nn.Module):
         # x_u = self.cross_attn_user(H_user_proj, W_user_proj, P_user_proj)  # (B, 2*K, d_model)
         x_u = H_user_proj # (B, 2*K, d_model)
         for layer in self.user_mhca_layers:
-            x_u = layer(x_u, W_user_proj, P_user_proj)
+            x_u = layer(x_u, W_user_proj, P_user_proj, attn_mask=user_attn_mask)
         x_u_final = x_u
 
         # ---------------------------
@@ -518,6 +563,38 @@ def get_mmse_obj(H, W):  ### H: (B, num_users, num_tx), W: (B, num_tx, num_users
     trace_real = th.real(th.stack([th.trace(prod[i]) for i in range(prod.size(0))]))
     MSE_obj = fro_norm - 2 * trace_real ## (B,)
     return MSE_obj.mean()
+
+### Save a complex matrix to a text file
+def save_matrix_to_txt(matrix, filename):
+    with open(filename, 'w') as f:
+        # Write shape information
+        f.write(f"Shape: {matrix.shape}\n\n")
+        
+        # Write real part
+        f.write("Real part:\n")
+        for row in matrix.real:
+            f.write(" ".join([f"{val:.6f}" for val in row]))
+            f.write("\n")
+        
+        # Write imaginary part
+        f.write("\nImaginary part:\n")
+        for row in matrix.imag:
+            f.write(" ".join([f"{val:.6f}" for val in row]))
+            f.write("\n")
+
+### Save a real-valued matrix to a text file
+def save_real_matrix_to_txt(matrix, filename):
+    """Save a real-valued matrix to a text file"""
+    with open(filename, 'w') as f:
+        # Write shape information
+        f.write(f"Shape: {matrix.shape}\n\n")
+        
+        # Write matrix values with row indices
+        f.write("Values:\n")
+        for row_idx, row in enumerate(matrix):
+            row_str = " ".join([f"{val:.6f}" for val in row])
+            f.write(f"{row_idx}: {row_str}\n")
+
 
 #############################################
 # 6. Training Routine
@@ -612,47 +689,79 @@ def train_beamforming_transformer(config, pretrained_path: str = None, history_p
             # generate masked inputs and attention masks
             H_mask, W_mask, P_mask, H_act, W_act, P_act, user_attn_mask, antenna_attn_mask, M_out, i_idx, j_idx = generate_batch_masks(H_mat, activated_degree)
 
-            # predict next beamformer from masked inputs
-            # W_next = model(H_mask, W_mask, P_mask, user_attn_mask=user_attn_mask, antenna_attn_mask=antenna_attn_mask, input_mask=M_out, activated_degree=activated_degree)
-            W_next = model(H_act, W_act) # (B, beam_dim)
+            #### test the masking mechanism
+            # save_dir = f"{config.num_users_outer}_{config.num_tx_outer}_matrices"
+            # os.makedirs(save_dir, exist_ok=True)
+            # save_matrix_to_txt(H_mask[0], os.path.join(save_dir, f"H_mask.txt"))
+            # save_matrix_to_txt(H_act[0], os.path.join(save_dir, f"H_act.txt"))
+            # save_matrix_to_txt(W_mask[0], os.path.join(save_dir, f"W_mask.txt"))
+            # save_matrix_to_txt(W_act[0], os.path.join(save_dir, f"W_act.txt"))
+            # save_real_matrix_to_txt(user_attn_mask[0], os.path.join(save_dir, f"user_attn_mask.txt"))
+            # save_real_matrix_to_txt(antenna_attn_mask[0], os.path.join(save_dir, f"antenna_attn_mask.txt"))
+            # print(f"i_idx: {i_idx}, j_idx: {j_idx}")
+            # bp()
 
-            W_next_real = W_next[:, :config.num_tx * config.num_users].reshape(-1, config.num_users, config.num_tx)
-            W_next_imag = W_next[:, config.num_users * config.num_tx:].reshape(-1, config.num_users, config.num_tx)
-            W_next_mat = W_next_real + 1j * W_next_imag  # (B, num_users, num_tx)
-
-            W_next_act_real = th.zeros(batch_size, config.num_users_outer, config.num_tx_outer, device=device)
-            W_next_act_imag = th.zeros(batch_size, config.num_users_outer, config.num_tx_outer, device=device)
-
-            #### try to zero-padding based on the matrix W_next_act
+            ##### predict next beamformer from masked inputs
+            W_next = model(H_mask, W_mask, user_attn_mask=user_attn_mask, antenna_attn_mask=antenna_attn_mask)
+            # W_next = model(H_act, W_act, user_attn_mask=None, antenna_attn_mask=None) # (B, beam_dim)
+            # W_next = model(H_mask, W_mask) # (B, beam_dim)
+            
+            ############ create the activated indices
             batch_indices = th.arange(batch_size, device=device).view(-1, 1, 1) # (B, 1, 1)
             batch_indices = batch_indices.expand(-1, activated_degree, activated_degree) # (B, m, m)
             user_indices = i_idx.view(1, -1, 1).expand(batch_size, -1, activated_degree) # (B, m, m)
             ant_indices = j_idx.view(1, 1, -1).expand(batch_size, activated_degree, -1) # (B, m, m)
 
-            W_next_act_real[batch_indices, user_indices, ant_indices] = W_next_real
-            W_next_act_imag[batch_indices, user_indices, ant_indices] = W_next_imag
-            W_next_act = W_next_act_real + 1j * W_next_act_imag  # (B, num_users_outer, num_tx_outer)
+            ############ first zero-padding the W_act to the full size
+            # W_full_act_real = th.zeros(batch_size, config.num_users_outer, config.num_tx_outer, device=device)
+            # W_full_act_imag = th.zeros(batch_size, config.num_users_outer, config.num_tx_outer, device=device)
 
-            W0 = W_act.transpose(-1, -2).to(device)  # (B, num_tx, num_users)
-            vec_w0 = th.cat((th.real(W0).reshape(-1, config.num_tx * config.num_users), th.imag(W0).reshape(-1, config.num_tx * config.num_users)), dim=-1)
-            vec_w0 = vec_w0.reshape(-1, 2 * config.num_tx * config.num_users)
-            norm_W0 = th.norm(vec_w0, dim=1, keepdim=True)
-            normlized_W0 = vec_w0 / norm_W0
+            # W_full_act_real[batch_indices, user_indices, ant_indices] = W_act.real
+            # W_full_act_imag[batch_indices, user_indices, ant_indices] = W_act.imag
+            # W_full_act = W_full_act_real + 1j * W_full_act_imag  # (B, num_users_outer, num_tx_outer)
 
-            # Reconstruct complex beamformer: (B, num_tx, num_users)
-            W_mat_0 = (normlized_W0[:, :config.num_tx * config.num_users].reshape(-1, config.num_tx, config.num_users) + 1j * normlized_W0[:, config.num_tx * config.num_users:].reshape(-1, config.num_tx, config.num_users))
-            rate_0 = sum_rate(H_act, W_mat_0, sigma2=config.sigma2)
-            if not mmse_rate_printed:
-                mmse_rate_printed = True
-                print(f"MMSE Rate: {rate_0.item():.4f}")
+            W_full_act = W_mask ### originally W_mask is W_act after zero-padding
 
-            W_next_act = W_next_act.transpose(-1, -2).to(device)  # (B, num_tx, num_users)
-            total_rate = sum_rate(H_act, W_next_act, sigma2=config.sigma2)
+            W_full_act_inv = W_full_act.transpose(-1, -2).to(device)  # (B, num_tx_outer, num_users_outer)
+            vec_w_full_act = th.cat((th.real(W_full_act_inv).reshape(-1, config.num_tx_outer * config.num_users_outer), th.imag(W_full_act_inv).reshape(-1, config.num_tx_outer * config.num_users_outer)), dim=-1)
+            vec_w_full_act = vec_w_full_act.reshape(-1, 2 * config.num_tx_outer * config.num_users_outer)
+            norm_w_full_act = th.norm(vec_w_full_act, dim=1, keepdim=True)
+            normlized_vec_w_full_act = vec_w_full_act / norm_w_full_act # (B, 2 * num_tx_outer * num_users_outer)
+
+            ############ then zero-padding the W_next to the full size
+            W_next_real = W_next[:, :config.num_tx * config.num_users].reshape(-1, config.num_users, config.num_tx)
+            W_next_imag = W_next[:, config.num_users * config.num_tx:].reshape(-1, config.num_users, config.num_tx)
+            W_next_mat = W_next_real + 1j * W_next_imag  # (B, num_users, num_tx)
+
+            W_full_next_real = th.zeros(batch_size, config.num_users_outer, config.num_tx_outer, device=device)
+            W_full_next_imag = th.zeros(batch_size, config.num_users_outer, config.num_tx_outer, device=device)
+
+            W_full_next_real[batch_indices, user_indices, ant_indices] = W_next_real
+            W_full_next_imag[batch_indices, user_indices, ant_indices] = W_next_imag
+            W_full_next = W_full_next_real + 1j * W_full_next_imag  # (B, num_users_outer, num_tx_outer)
+
+            W_full_next_inv = W_full_next.transpose(-1, -2).to(device)  # (B, num_tx_outer, num_users_outer)
+            vec_w_full_next = th.cat((th.real(W_full_next_inv).reshape(-1, config.num_tx_outer * config.num_users_outer), th.imag(W_full_next_inv).reshape(-1, config.num_tx_outer * config.num_users_outer)), dim=-1)
+            vec_w_full_next = vec_w_full_next.reshape(-1, 2 * config.num_tx_outer * config.num_users_outer)
+            norm_w_full_next = th.norm(vec_w_full_next, dim=1, keepdim=True)
+            normlized_vec_w_full_next = vec_w_full_next / norm_w_full_next # (B, 2 * num_tx_outer * num_users_outer)
+
+            # # Reconstruct complex beamformer: (B, num_tx_outer, num_users_outer)
+            # W_mat_0 = (normlized_vec_w_full_act[:, :config.num_tx_outer * config.num_users_outer].reshape(-1, config.num_tx_outer, config.num_users_outer) + 1j * normlized_vec_w_full_act[:, config.num_tx_outer * config.num_users_outer:].reshape(-1, config.num_tx_outer, config.num_users_outer))
+            # rate_0 = sum_rate(H_mask, W_mat_0, sigma2=config.sigma2)
+            # if not mmse_rate_printed:
+            #     mmse_rate_printed = True
+            #     print(f"MMSE Rate: {rate_0.item():.4f}")
+            # bp()
+
+            W_next_mat = W_next_mat.transpose(-1, -2).to(device)  # (B, num_tx, num_users)
+            # total_rate = sum_rate(H_act, W_next_mat, sigma2=config.sigma2)
+            total_rate = sum_rate(H_mask, W_full_next_inv, sigma2=config.sigma2)
 
             # vec_w_next = th.cat((th.real(W_next).reshape(-1, config.num_tx * config.num_users), th.imag(W_next).reshape(-1, config.num_tx * config.num_users)), dim=-1)
             # vec_w_next = vec_w_next.reshape(-1, 2 * config.num_tx * config.num_users)
 
-            total_mse_loss = fun.mse_loss(W_next, normlized_W0)
+            total_mse_loss = fun.mse_loss(normlized_vec_w_full_next, normlized_vec_w_full_act)
           
             loss_unsupervised = - total_rate
             loss_supervised = total_mse_loss
