@@ -362,14 +362,14 @@ class BeamformingTransformer(nn.Module):
         # self.cross_attn_user = CrossAttentionBlock(d_model=config.d_model, n_head=config.n_head, 
         #                                              attn_pdrop=config.attn_pdrop, resid_pdrop=config.resid_pdrop)
         
+        #### generate delta_w and delta_p for antenna and user-level
+        self.inter_w_ant = nn.ModuleList([nn.Linear(d_model, d_model) for _ in range(n_layers)])
+        self.inter_p_ant = nn.ModuleList([nn.Linear(d_model, d_model) for _ in range(n_layers)])
+        self.inter_w_user = nn.ModuleList([nn.Linear(d_model, d_model) for _ in range(n_layers)])
+        self.inter_p_user = nn.ModuleList([nn.Linear(d_model, d_model) for _ in range(n_layers)])
+
         # Final fusion and output projection MLP.
         total_tokens = 2*self.N + 2*self.K
-        # self.out_mlp = nn.Sequential(
-        #     nn.Linear(total_tokens * d_model, d_model),
-        #     # nn.ReLU(),  
-        #     nn.LeakyReLU(negative_slope=0.01),
-        #     nn.Linear(d_model, config.beam_dim)
-        # )
         self.out_proj = nn.Sequential(
             nn.Linear(total_tokens * config.d_model, 4 * config.d_model),
             nn.LayerNorm(4 * config.d_model),
@@ -408,7 +408,8 @@ class BeamformingTransformer(nn.Module):
         B = H.size(0)
         K = self.K  # Number of users
         N = self.N  # Number of transmit antennas
-             
+        
+        Prod = th.bmm(H, W_prev.transpose(-1, -2))  # (B, K, K)
         # ---------------------------
         # 1. Antenna-level Cross-Attention
         #    - Query tokens from H (column-wise tokens).
@@ -419,18 +420,21 @@ class BeamformingTransformer(nn.Module):
         # Antenna-level: tokens from columns
         H_ant = th.cat([H.real.transpose(1,2), H.imag.transpose(1,2)], dim=1)    # (B,2N,K)
         W_ant = th.cat([W_prev.real.transpose(1,2), W_prev.imag.transpose(1,2)], dim=1)  # (B,2N,K)
-        P_ant = th.cat([P_mask.real.transpose(1,2), P_mask.imag.transpose(1,2)], dim=1)  # (B,2K,K)
+        P_ant = th.cat([Prod.real.transpose(1,2), Prod.imag.transpose(1,2)], dim=1)  # (B,2K,K)
         
         # Project Query and Key tokens.
-        H_ant_proj = self.antenna_channel_proj(H_ant)  # (B, 2*N, d_model)
-        W_ant_proj = self.antenna_beam_proj(W_ant)       # (B, 2*N, d_model)
-        P_ant_proj = self.antenna_prod_proj(P_ant)  # (B, 2*K, d_model)
+        ant_q = self.antenna_channel_proj(H_ant)  # (B, 2*N, d_model)
+        ant_k = self.antenna_beam_proj(W_ant)       # (B, 2*N, d_model)
+        ant_v = self.antenna_prod_proj(P_ant)  # (B, 2*K, d_model)
         
         # Multi-layer Cross-attention blocks for antenna-level
-        x_a = H_ant_proj
-        for layer in self.ant_mhca_layers:
-            x_a = layer(x_a, W_ant_proj, P_ant_proj, attn_mask =antenna_attn_mask, self_attn_mask=antenna_attn_mask)  
-        x_a_final = x_a
+        for i in range(self.config.n_layers):
+            ant_q = self.ant_mhca_layers[i](ant_q, ant_k, ant_v, attn_mask =antenna_attn_mask, self_attn_mask=antenna_attn_mask)  
+            delta_w_ant = self.inter_w_ant[i](ant_q)
+            delta_p_ant = self.inter_p_ant[i](ant_q)
+            ant_k = ant_k + delta_w_ant  # Update Key tokens
+            ant_v = ant_v + delta_p_ant  # Update Value tokens  
+        x_a_final = ant_q
 
         # ---------------------------
         # 2. User-level Cross-Attention
@@ -443,16 +447,18 @@ class BeamformingTransformer(nn.Module):
         P_user = th.cat([P_mask.real, P_mask.imag], dim=1)  # (B,2K,K)
         
         # Project Query and Key tokens.
-        H_user_proj = self.user_channel_proj(H_user)
-        W_user_proj = self.user_beam_proj(W_user)
-        P_user_proj = self.user_prod_proj(P_user)
+        user_q = self.user_channel_proj(H_user)  # (B, 2*N, d_model)
+        user_k = self.user_beam_proj(W_user)       # (B, 2*N, d_model)
+        user_v = self.user_prod_proj(P_user)  # (B, 2*K, d_model)
         
-        # Cross-attention for user-level.
-        # x_u = self.cross_attn_user(H_user_proj, W_user_proj, P_user_proj)  # (B, 2*K, d_model)
-        x_u = H_user_proj # (B, 2*K, d_model)
-        for layer in self.user_mhca_layers:
-            x_u = layer(x_u, W_user_proj, P_user_proj, attn_mask = user_attn_mask, self_attn_mask=user_attn_mask)
-        x_u_final = x_u
+        # Multi-layer Cross-attention blocks for user-level
+        for i in range(self.config.n_layers):
+            user_q = self.user_mhca_layers[i](user_q, user_k, user_v, attn_mask = user_attn_mask, self_attn_mask=user_attn_mask)  
+            delta_w_user = self.inter_w_user[i](user_q)
+            delta_p_user = self.inter_p_user[i](user_q)
+            user_k = user_k + delta_w_user  # Update Key tokens
+            user_v = user_v + delta_p_user  # Update Value tokens  
+        x_u_final = user_q
 
         # ---------------------------
         # 3. Fusion and Output Prediction
@@ -471,6 +477,7 @@ class BeamformingTransformer(nn.Module):
         ### based on zero-masking, might lose some training results
         if input_mask is not None:
             W_complex = W_complex * input_mask ## Hardamard product
+            
         W_norm = th.sqrt((W_complex.conj() * W_complex).sum(dim=(-2, -1)).real)
         W_normalized = W_complex / W_norm.view(-1, 1, 1)
         W_next = W_normalized.transpose(-1, -2)  # (B, num_tx, num_users)

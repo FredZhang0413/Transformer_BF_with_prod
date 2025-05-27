@@ -111,7 +111,7 @@ def generate_batch_masks(H_mat, activated_degree):
     M = th.zeros((K, N), device=device)
     ii, jj = th.meshgrid(i_idx, j_idx, indexing='ij')
     M[ii, jj] = 1.0
-    M_out = M.unsqueeze(0).expand(B, -1, -1)  # (B, K, N)
+    input_mask = M.unsqueeze(0).expand(B, -1, -1)  # (B, K, N)
 
     H_mask = H_mat * M.unsqueeze(0)
     H_act = H_mask[:, i_idx][:, :, j_idx] # (B, m, m)
@@ -154,7 +154,7 @@ def generate_batch_masks(H_mat, activated_degree):
     user_attn_mask = mask_u.unsqueeze(0).expand(B, -1, -1)  # (B, 2K, 2K)
     antenna_attn_mask = mask_a.unsqueeze(0).expand(B, -1, -1)  # (B, 2N, 2N)
     
-    return H_mask, W_mask, P_mask, H_act, W_act, P_act, user_attn_mask, antenna_attn_mask, M_out
+    return H_mask, W_mask, P_mask, H_act, W_act, P_act, user_attn_mask, antenna_attn_mask, input_mask
 
 
 
@@ -397,7 +397,7 @@ class BeamformingTransformer(nn.Module):
         elif isinstance(module, nn.Embedding):
             nn.init.normal_(module.weight, mean=0.0, std=0.02)
     
-    def forward(self, H, W_prev, P_mask, user_attn_mask=None, antenna_attn_mask=None, input_mask = None):
+    def forward(self, H, W_prev, user_attn_mask=None, antenna_attn_mask=None, input_mask = None, data_mask = None):
         """
         Args:
             H: Complex channel matrix, shape (B, num_users, num_tx) (i.e. (B, K, N)).
@@ -408,6 +408,7 @@ class BeamformingTransformer(nn.Module):
         B = H.size(0)
         K = self.K  # Number of users
         N = self.N  # Number of transmit antennas
+        Prod = th.bmm(H, W_prev.transpose(-1, -2))  # (B, K, K)
              
         # ---------------------------
         # 1. Antenna-level Cross-Attention
@@ -419,7 +420,7 @@ class BeamformingTransformer(nn.Module):
         # Antenna-level: tokens from columns
         H_ant = th.cat([H.real.transpose(1,2), H.imag.transpose(1,2)], dim=1)    # (B,2N,K)
         W_ant = th.cat([W_prev.real.transpose(1,2), W_prev.imag.transpose(1,2)], dim=1)  # (B,2N,K)
-        P_ant = th.cat([P_mask.real.transpose(1,2), P_mask.imag.transpose(1,2)], dim=1)  # (B,2K,K)
+        P_ant = th.cat([Prod.real.transpose(1,2), Prod.imag.transpose(1,2)], dim=1)  # (B,2K,K)
         
         # Project Query and Key tokens.
         H_ant_proj = self.antenna_channel_proj(H_ant)  # (B, 2*N, d_model)
@@ -440,7 +441,7 @@ class BeamformingTransformer(nn.Module):
         # ---------------------------
         H_user = th.cat([H.real, H.imag], dim=1)    # (B,2K,N)
         W_user = th.cat([W_prev.real, W_prev.imag], dim=1)  # (B,2K,N)
-        P_user = th.cat([P_mask.real, P_mask.imag], dim=1)  # (B,2K,K)
+        P_user = th.cat([Prod.real, Prod.imag], dim=1)  # (B,2K,K)
         
         # Project Query and Key tokens.
         H_user_proj = self.user_channel_proj(H_user)
@@ -468,9 +469,11 @@ class BeamformingTransformer(nn.Module):
         W_imag = W_next_vec[:, config.num_users * config.num_tx:].reshape(-1, config.num_users, config.num_tx)
         W_complex = W_real + 1j * W_imag
 
-        ### based on zero-masking, might lose some training results
-        if input_mask is not None:
-            W_complex = W_complex * input_mask ## Hardamard product
+        # if input_mask is not None:
+        #     W_complex = W_complex * input_mask ## Hardamard product
+        if data_mask is not None:
+            W_complex = W_complex * data_mask ## Hardamard product
+
         W_norm = th.sqrt((W_complex.conj() * W_complex).sum(dim=(-2, -1)).real)
         W_normalized = W_complex / W_norm.view(-1, 1, 1)
         W_next = W_normalized.transpose(-1, -2)  # (B, num_tx, num_users)
@@ -542,13 +545,12 @@ def lr_lambda(epoch, config):
     return max(0.2, cosine_decay)
 
 
-def get_mmse_obj(H, W):  ### H: (B, num_users, num_tx), W: (B, num_tx, num_users)
+def get_mmse_obj(H, W, sigma2=1.0):
     prod = th.bmm(H, W)  # (B, num_users, num_users)
     fro_norm = th.norm(prod, p='fro', dim=(1,2)) ** 2
-    trace_real = th.real(th.stack([th.trace(prod[i]) for i in range(prod.size(0))]))
-    MSE_obj = fro_norm - 2 * trace_real ## (B,)
-    return MSE_obj.mean()
-        
+    trace_real = th.stack([th.trace(prod).real for prod in prod])
+    MSE_obj = fro_norm - trace_real
+    return MSE_obj
 
 #############################################
 # 6. Training Routine
@@ -566,38 +568,26 @@ def train_beamforming_transformer(config, pretrained_path: str = None, history_p
     
     device = th.device("cuda" if th.cuda.is_available() else "cpu")
 
-    ## 1) Instantiate the model
+    # 1) Instantiate the model
     model = BeamformingTransformer(config).to(device)
 
-    ## 2) Set up the optimizer and learning rate scheduler
-    ###### scheme 1 (linearly decays lr)
+    ###### optimizer and lr scheduler: scheme 1 (linearly decays lr)
     optimizer = configure_optimizer(model, config.learning_rate, config.weight_decay)
     scheduler = th.optim.lr_scheduler.LambdaLR(optimizer, lambda epoch: 1 - 0.5 * (epoch / config.max_epoch))
 
-    ####### scheme 2 (warm-start + cosine decay)
+    # ####### optimizer and lr scheduler: scheme 2 (warm-start + cosine decay)
     # optimizer = configure_optimizer(model, config.learning_rate, config.weight_decay)
     # scheduler = th.optim.lr_scheduler.LambdaLR(optimizer, lambda epoch: lr_lambda(epoch, config))
 
-    #### scheme 3: freese all parameters except for the final MLP layer: out_proj
-    # for name, param in model.named_parameters():
-    #     if not 'out_proj' in name:
-    #         param.requires_grad = False
-    #     else:
-    #         param.requires_grad = True
-    # optimizer = th.optim.AdamW(filter(lambda p: p.requires_grad, model.parameters()), 
-    #                       lr=config.learning_rate, 
-    #                       weight_decay=config.weight_decay)
-    # scheduler = th.optim.lr_scheduler.LambdaLR(optimizer, lambda epoch: 1 - 0.5 * (epoch / config.max_epoch))
-
-    # 3) Optionally load pretrained weights
+    # 2) Optionally load pretrained weights
     if pretrained_path is not None:
         checkpoint = th.load(pretrained_path, map_location=device)
         model.load_state_dict(checkpoint['model_state_dict'])
         print(f"Loaded pretrained weights from {pretrained_path}")
-        # optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-        # scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+        optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+        scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
 
-    # 4) Optionally load pre-stored history
+    # 3) Optionally load pre-stored history
     if history_path is not None and pretrained_path is not None:
         saved_history = th.load(history_path)
         rate_history = saved_history.get('rate_history', [])
@@ -622,17 +612,12 @@ def train_beamforming_transformer(config, pretrained_path: str = None, history_p
     save_dir = f"{config.num_users}_{config.num_tx}_rpe_mask"
     os.makedirs(save_dir, exist_ok=True)
     best_model_path = os.path.join(save_dir, "best_model.pt")
-
-    # epochs_group = []
     
     for epoch in range(start_epoch_prev, config.max_epoch):
 
         activated_degree = min(config.num_users, config.start_degree + config.degree_incre * (epoch // config.degree_epoch))  # Gradually increase the number of activated users.
-        incre_epoch = config.degree_epoch * (((config.num_users - config.start_degree) // config.degree_incre) + 1) ### total epochs when adopt overall teacher weight update
-        # print(incre_epoch)
-        # bp()
+        incre_epoch = (config.degree_epoch // config.degree_incre) * (config.num_users - config.start_degree)
         scale_weight = 2000 * (activated_degree - config.start_degree + 1) 
-        # scale_weight = 1 / config.num_users
         # cosine decay teacher weight.
         # if epoch < 200:
         #     teacher_weight = 0.9
@@ -643,17 +628,10 @@ def train_beamforming_transformer(config, pretrained_path: str = None, history_p
         # else:
         #     teacher_weight = 0.0
 
-        ## 1. Soft switch learning policy throughout the training process
+        # # Soft switch learning policy.
         teacher_weight = max(0.1, 1 - (epoch / incre_epoch))
-
-        # ## 2. Soft switch learning policy within each activated degree
-        # if activated_degree < config.num_users:
-        #     teacher_weight = max(0.1, 1 - (epoch % config.degree_epoch) / config.degree_epoch)
-        # else:
-        #     final_start_epoch = config.degree_epoch * (config.num_users - config.start_degree) // config.degree_incre
-        #     teacher_weight = max(0.1, 1 - (epoch - final_start_epoch) / config.degree_epoch)
-
-        print(teacher_weight)
+        inactive_decay = max(0.0, 0.1 - 0.1 * (epoch / incre_epoch))
+        # teacher_weight = 0.0  
 
         epoch_loss = 0
         epoch_rate = 0
@@ -671,44 +649,50 @@ def train_beamforming_transformer(config, pretrained_path: str = None, history_p
             H_mat = H_tensor[:, 0, :, :] + 1j * H_tensor[:, 1, :, :]
 
             # generate masked inputs and attention masks
-            H_mask, W_mask, P_mask, H_act, W_act, P_act, user_attn_mask, antenna_attn_mask, M_out = generate_batch_masks(H_mat, activated_degree)
+            H_mask, W_mask, P_mask, H_act, W_act, P_act, user_attn_mask, antenna_attn_mask, input_mask = generate_batch_masks(H_mat, activated_degree)
+            
+            # data_mask = input_mask ### overall hard mask 
+            ### Where input_mask=0, set data_mask=inactive_decay; where input_mask=1, set data_mask=1
+            data_mask = th.ones_like(input_mask) * inactive_decay  # Initialize with inactive_decay everywhere
+            data_mask = th.where(input_mask == 1, th.ones_like(input_mask), data_mask)  # Set 1 where input_mask is 1
+            H_mask = H_mask * data_mask
+            W_mask = W_mask * data_mask
 
             # predict next beamformer from masked inputs
-            W_next = model(H_mask, W_mask, P_mask, user_attn_mask=user_attn_mask, antenna_attn_mask=antenna_attn_mask, input_mask=M_out) #(B, num_tx, num_users)
+            W_next = model(H_mask, W_mask, user_attn_mask=user_attn_mask, antenna_attn_mask=antenna_attn_mask, input_mask=input_mask, data_mask=data_mask)
+            # print(f"Predicted W: {W_next[0]}")
+            # bp()
             # W_mat = (W_next[:, :config.num_tx * config.num_users].reshape(-1, config.num_tx, config.num_users) + 1j * W_next[:, config.num_tx * config.num_users:].reshape(-1, config.num_tx, config.num_users))
             # total_rate = sum_rate(H_mat, W_mat, sigma2=config.sigma2)
             total_rate = sum_rate(H_mask, W_next, sigma2=config.sigma2)
-            # print(f"Total Rate: {total_rate.item():.4f}")
 
             # W_act = W_act.transpose(-1, -2)  # (B, num_tx, num_users)
             # rate_test = sum_rate(H_act, W_act, sigma2=config.sigma2)
             # print(f"MMSE Rate: {rate_test:.4f}")
             # bp()
-            
-            #### adopt supervised MSE loss
             W_mask = W_mask.transpose(-1, -2)  # (B, num_tx, num_users)
             # rate_test = sum_rate(H_mask, W_mask, sigma2=config.sigma2)
             # print(f"MMSE Rate: {rate_test:.4f}")
             # bp()
+            
             vec_w0 = th.cat((th.real(W_mask).reshape(-1, config.num_tx * config.num_users), th.imag(W_mask).reshape(-1, config.num_tx * config.num_users)), dim=-1)
             vec_w0 = vec_w0.reshape(-1, 2 * config.num_tx * config.num_users)
             norm_W0 = th.norm(vec_w0, dim=1, keepdim=True)
             normlized_W0 = vec_w0 / norm_W0 
+
             vec_w_next = th.cat((th.real(W_next).reshape(-1, config.num_tx * config.num_users), th.imag(W_next).reshape(-1, config.num_tx * config.num_users)), dim=-1)
             vec_w_next = vec_w_next.reshape(-1, 2 * config.num_tx * config.num_users)
-            total_mse_loss = fun.mse_loss(vec_w_next, normlized_W0)
 
-            # #### adopt unsupervised MSE loss
-            # total_mse_loss = get_mmse_obj(H_mask, W_next)
-            # # print(f"MMSE Loss: {total_mse_loss.item():.4f}")
+            total_mse_loss = fun.mse_loss(vec_w_next, normlized_W0)
           
             loss_unsupervised = - total_rate
             loss_supervised = total_mse_loss
             loss = (1 - teacher_weight) * loss_unsupervised + (teacher_weight * scale_weight) * loss_supervised ## supervised MSE
             rs_loss_term = (1 - teacher_weight) * loss_unsupervised
             mse_loss_term = (teacher_weight * scale_weight) * loss_supervised
-            # print(rs_loss_term.item(), mse_loss_term.item())
+            # print(loss_unsupervised.item(), 20000*loss_supervised.item())
             # bp()
+            # loss = (1 - teacher_weight) * loss_unsupervised + (teacher_weight / 50) * loss_supervised ## supervised MSE
             optimizer.zero_grad()
             loss.backward()
 
@@ -894,7 +878,7 @@ if __name__ == "__main__":
     batch_size = 128 
     learning_rate = 3e-4
     weight_decay = 0.01
-    max_epoch = 2000
+    max_epoch = 1000
     sigma2 = 1.0  
     SNR = 15
     SNR_power = 10 ** (SNR/10) # SNR power in dB
@@ -906,7 +890,7 @@ if __name__ == "__main__":
     subspace_dim = 4
     pbar_size = 1000
     start_degree = 4
-    degree_epoch = 100
+    degree_epoch = 50
     degree_incre = 2
 
     # # Example configuration where num_users = num_tx = 16.
@@ -956,7 +940,7 @@ if __name__ == "__main__":
         pbar_size=pbar_size,
         start_degree=start_degree,
         degree_epoch=degree_epoch,
-        degree_incre = degree_incre
+        degree_incre=degree_incre
     )
 
     model_path_stage_1 = f"{config.num_users}_{config.num_tx}_rpe_mask/best_model.pt"
@@ -964,4 +948,4 @@ if __name__ == "__main__":
     
     ### Train the beamforming transformer.
     train_beamforming_transformer(config) ## first time training
-    # train_beamforming_transformer(config, pretrained_path=model_path_stage_1, history_path=history_path_stage_1) ## training with pretrained model/historical data
+    #c train_beamforming_transformer(config, pretrained_path=model_path_stage_1, history_path=history_path_stage_1) ## training with pretrained model/historical data
