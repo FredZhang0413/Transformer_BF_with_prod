@@ -243,16 +243,12 @@ class BeamformingTransformer(nn.Module):
             for _ in range(config.n_layers)
         ])
 
-        #### generate delta_w and delta_p for antenna and user-level
-        self.inter_w_ant = nn.ModuleList([nn.Linear(d_model, d_model) for _ in range(n_layers)])
-        self.inter_p_ant = nn.ModuleList([nn.Linear(d_model, d_model) for _ in range(n_layers)])
-        self.inter_w_user = nn.ModuleList([nn.Linear(d_model, d_model) for _ in range(n_layers)])
-        self.inter_p_user = nn.ModuleList([nn.Linear(d_model, d_model) for _ in range(n_layers)])
+        # #### generate delta_w and delta_p for antenna and user-level
+        # self.inter_w_ant = nn.ModuleList([nn.Linear(d_model, d_model) for _ in range(n_layers)])
+        # self.inter_p_ant = nn.ModuleList([nn.Linear(d_model, d_model) for _ in range(n_layers)])
+        # self.inter_w_user = nn.ModuleList([nn.Linear(d_model, d_model) for _ in range(n_layers)])
+        # self.inter_p_user = nn.ModuleList([nn.Linear(d_model, d_model) for _ in range(n_layers)])
 
-        # self.cross_attn_ant = CrossAttentionBlock(d_model=config.d_model, n_head=config.n_head, 
-        #                                             attn_pdrop=config.attn_pdrop, resid_pdrop=config.resid_pdrop)
-        # self.cross_attn_user = CrossAttentionBlock(d_model=config.d_model, n_head=config.n_head, 
-        #                                              attn_pdrop=config.attn_pdrop, resid_pdrop=config.resid_pdrop)
         
         # Final fusion and output projection MLP.
         total_tokens = 2*self.N + 2*self.K
@@ -327,20 +323,19 @@ class BeamformingTransformer(nn.Module):
         H_ant_proj = H_ant_proj + self.pos_emb_ant_H.unsqueeze(0)
         W_ant_proj = W_ant_proj + self.pos_emb_ant_W.unsqueeze(0)
         
-        # Multi-layer Cross-attention blocks for antenna-level
-        # x_a = self.cross_attn_ant(H_ant_proj, W_ant_proj, P_ant_proj)  # (B, 2*N, d_model)
-        # x_a = H_ant_proj
-        # for layer in self.ant_mhca_layers:
-        #     x_a = layer(x_a, W_ant_proj, P_ant_proj)  
-        # x_a_final = x_a
+        ### Multi-layer Cross-attention blocks for antenna-level
+        x_a = H_ant_proj
+        for layer in self.ant_mhca_layers:
+            x_a = layer(x_a, W_ant_proj, P_ant_proj)  
+        x_a_final = x_a
 
-        for i in range(self.config.n_layers):
-            H_ant_proj = self.ant_mhca_layers[i](H_ant_proj, W_ant_proj, P_ant_proj)  # (B, 2*N, d_model)
-            delta_w_ant = self.inter_w_ant[i](H_ant_proj)  # (B, 2*N, d_model)
-            delta_p_ant = self.inter_p_ant[i](P_ant_proj)  # (B, 2*K, d_model)
-            W_ant_proj = W_ant_proj + delta_w_ant  # Update Key tokens
-            P_ant_proj = P_ant_proj + delta_p_ant  # Update Value tokens
-        x_a_final = H_ant_proj  # Final output for antenna-level
+        # for i in range(self.config.n_layers):
+        #     H_ant_proj = self.ant_mhca_layers[i](H_ant_proj, W_ant_proj, P_ant_proj)  # (B, 2*N, d_model)
+        #     delta_w_ant = self.inter_w_ant[i](H_ant_proj)  # (B, 2*N, d_model)
+        #     delta_p_ant = self.inter_p_ant[i](P_ant_proj)  # (B, 2*K, d_model)
+        #     W_ant_proj = W_ant_proj + delta_w_ant  # Update Key tokens
+        #     P_ant_proj = P_ant_proj + delta_p_ant  # Update Value tokens
+        # x_a_final = H_ant_proj  # Final output for antenna-level
 
         # ---------------------------
         # 2. User-level Cross-Attention
@@ -367,20 +362,19 @@ class BeamformingTransformer(nn.Module):
         H_user_proj = H_user_proj + self.pos_emb_user_H.unsqueeze(0)
         W_user_proj = W_user_proj + self.pos_emb_user_W.unsqueeze(0)
         
-        # Cross-attention for user-level.
-        # x_u = self.cross_attn_user(H_user_proj, W_user_proj, P_user_proj)  # (B, 2*K, d_model)
-        # x_u = H_user_proj # (B, 2*K, d_model)
-        # for layer in self.user_mhca_layers:
-        #     x_u = layer(x_u, W_user_proj, P_user_proj)
-        # x_u_final = x_u
+        ### Cross-attention for user-level.
+        x_u = H_user_proj # (B, 2*K, d_model)
+        for layer in self.user_mhca_layers:
+            x_u = layer(x_u, W_user_proj, P_user_proj)
+        x_u_final = x_u
 
-        for i in range(self.config.n_layers):
-            H_user_proj = self.user_mhca_layers[i](H_user_proj, W_user_proj, P_user_proj)
-            delta_w_user = self.inter_w_user[i](H_user_proj)  # (B, 2*K, d_model)
-            delta_p_user = self.inter_p_user[i](P_user_proj)  # (B, 2*K, d_model)
-            W_user_proj = W_user_proj + delta_w_user  # Update Key tokens
-            P_user_proj = P_user_proj + delta_p_user  # Update Value tokens
-        x_u_final = H_user_proj  # Final output for user-level
+        # for i in range(self.config.n_layers):
+        #     H_user_proj = self.user_mhca_layers[i](H_user_proj, W_user_proj, P_user_proj)
+        #     delta_w_user = self.inter_w_user[i](H_user_proj)  # (B, 2*K, d_model)
+        #     delta_p_user = self.inter_p_user[i](P_user_proj)  # (B, 2*K, d_model)
+        #     W_user_proj = W_user_proj + delta_w_user  # Update Key tokens
+        #     P_user_proj = P_user_proj + delta_p_user  # Update Value tokens
+        # x_u_final = H_user_proj  # Final output for user-level
 
         # ---------------------------
         # 3. Fusion and Output Prediction
@@ -420,6 +414,7 @@ class ChannelDataset(Dataset):
 # 5. Optimizer configuration
 #############################################
 
+# def configure_optimizer(model, learning_rate, weight_decay, momentum=0.9, nesterov=True):
 def configure_optimizer(model, learning_rate, weight_decay):
     """
     Configure optimizer with selective weight decay for linear and conv2d layers.
@@ -441,30 +436,40 @@ def configure_optimizer(model, learning_rate, weight_decay):
         {'params': no_decay_params, 'weight_decay': 0.0}
     ]
     
+    #### early-stage optimizer
     optimizer = th.optim.AdamW(optimizer_grouped_parameters, lr=learning_rate)
+
+    # #### later-stage optimizer
+    # optimizer = th.optim.SGD(
+    #     optimizer_grouped_parameters, 
+    #     lr=learning_rate, 
+    #     momentum=momentum, 
+    #     nesterov=nesterov
+    # )
+
     return optimizer
 
 
-def lr_lambda(epoch, config):
-    ## warm start
-    total_steps = config.max_epoch
-    warmup_steps = int(total_steps * 0.00)  
-    ## linearly increase the lr in the warm-up phase
-    if epoch < warmup_steps:
-        return math.sqrt(float(epoch) / float(max(1, warmup_steps)))   
-    ## cosine decay after warm-up
-    progress = float(epoch - warmup_steps) / float(max(1, total_steps - warmup_steps))
-    cosine_decay = 0.5 * (1.0 + math.cos(math.pi * progress)) ## 1 -> 0
-    # minimum learning rate: 0.05 * initial_lr
-    return max(0.2, cosine_decay)
+# def lr_lambda(epoch, config):
+#     ## warm start
+#     total_steps = config.max_epoch
+#     warmup_steps = int(total_steps * 0.05)  
+#     ## linearly increase the lr in the warm-up phase
+#     if epoch < warmup_steps:
+#         return math.sqrt(float(epoch) / float(max(1, warmup_steps)))   
+#     ## cosine decay after warm-up
+#     progress = float(epoch - warmup_steps) / float(max(1, total_steps - warmup_steps))
+#     cosine_decay = 0.5 * (1.0 + math.cos(math.pi * progress)) ## 1 -> 0
+#     # minimum learning rate: 0.05 * initial_lr
+#     return max(0.2, cosine_decay)
 
 
-def get_mmse_obj(H, W, sigma2=1.0):
-    prod = th.bmm(H, W)  # (B, num_users, num_users)
-    fro_norm = th.norm(prod, p='fro', dim=(1,2)) ** 2
-    trace_real = th.stack([th.trace(prod).real for prod in prod])
-    MSE_obj = fro_norm - trace_real
-    return MSE_obj
+# def get_mmse_obj(H, W, sigma2=1.0):
+#     prod = th.bmm(H, W)  # (B, num_users, num_users)
+#     fro_norm = th.norm(prod, p='fro', dim=(1,2)) ** 2
+#     trace_real = th.stack([th.trace(prod).real for prod in prod])
+#     MSE_obj = fro_norm - trace_real
+#     return MSE_obj
 
 #############################################
 # 6. Training Routine
@@ -486,11 +491,31 @@ def train_beamforming_transformer(config, pretrained_path: str = None, history_p
 
     ###### optimizer and lr scheduler: scheme 1 (linearly decays lr)
     optimizer = configure_optimizer(model, config.learning_rate, config.weight_decay)
-    scheduler = th.optim.lr_scheduler.LambdaLR(optimizer, lambda epoch: 1 - 0.5 * (epoch / config.max_epoch))
+    # scheduler = th.optim.lr_scheduler.LambdaLR(optimizer, lambda epoch: 1 - 0.5 * (epoch / config.max_epoch))
 
     # ####### optimizer and lr scheduler: scheme 2 (warm-start + cosine decay)
     # optimizer = configure_optimizer(model, config.learning_rate, config.weight_decay)
     # scheduler = th.optim.lr_scheduler.LambdaLR(optimizer, lambda epoch: lr_lambda(epoch, config))
+
+    # ####### optimizer and lr scheduler: scheme 3 (SGD_momentum + cosine decay)
+    # optimizer = configure_optimizer(
+    #     model, 
+    #     config.learning_rate, 
+    #     config.weight_decay,
+    #     momentum=config.momentum,  
+    #     nesterov=config.nesterov   
+    # )
+
+    # Cosine annealing scheduler with warmup
+    # scheduler = th.optim.lr_scheduler.LambdaLR(
+    #     optimizer, 
+    #     lr_lambda=lambda epoch: lr_lambda(epoch, config)
+    # )
+    scheduler = th.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer,
+        T_max=config.max_epoch,  
+        eta_min=config.learning_rate * 0.1  
+    )
 
     # 2) Optionally load pretrained weights
     if pretrained_path is not None:
@@ -526,20 +551,10 @@ def train_beamforming_transformer(config, pretrained_path: str = None, history_p
     os.makedirs(save_dir, exist_ok=True)
     best_model_path = os.path.join(save_dir, "best_model.pt")
     
-    for epoch in range(start_epoch_prev, config.max_epoch):
-
-        # # cosine decay teacher weight.
-        # if epoch < 200:
-        #     teacher_weight = 0.9
-        # elif epoch < 700 and epoch >= 200:
-        #     progress = epoch - 200
-        #     decay_span = 500
-        #     teacher_weight = 0.45 * (1 + math.cos(math.pi * progress / decay_span))
-        # else:
-        #     teacher_weight = 0.0
+    for epoch in range(config.max_epoch):
 
         # # Soft switch learning policy.
-        teacher_weight = max(0.1, 1 - (epoch / 200))
+        teacher_weight = max(0.2, 1 - (epoch / 200))
         # teacher_weight = 0.0  
 
         epoch_loss = 0
@@ -592,8 +607,7 @@ def train_beamforming_transformer(config, pretrained_path: str = None, history_p
                 # ### unsupervised MSE loss
                 # mse_loss = get_mmse_obj(H_mat, W_mat, sigma2=config.sigma2)   
                 # total_mse_loss += mse_loss.mean()            
-                
-            
+                         
             loss_unsupervised = - total_rate / config.T
             loss_supervised = total_mse_loss / config.T
             loss = (1 - teacher_weight) * loss_unsupervised + (teacher_weight * 20000) * loss_supervised ## supervised MSE
@@ -603,10 +617,9 @@ def train_beamforming_transformer(config, pretrained_path: str = None, history_p
             optimizer.zero_grad()
             loss.backward()
 
-            # ### add gradient clipping
-            # th.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-            ### test gradient values
-            th.nn.utils.clip_grad_norm_(model.parameters(), max_norm=100.0)
+            ### gradient clipping with decay
+            max_norm = 5.0 * (1.0 - 0.8 * (epoch / config.max_epoch))  # Decay max_norm
+            th.nn.utils.clip_grad_norm_(model.parameters(), max_norm=max_norm)
             # print(f"Gradient norm: {grad_norm:.4f}\n")
 
             optimizer.step()
@@ -706,54 +719,33 @@ class BeamformerTransformerConfig:
         self.mlp_ratio = kwargs['mlp_ratio']
         self.subspace_dim = kwargs['subspace_dim']
         self.pbar_size = kwargs['pbar_size']
+        self.momentum = kwargs['momentum']
+        self.nesterov = kwargs['nesterov']
 
 if __name__ == "__main__":
 
-    # # Example configuration where num_users = num_tx = 16.
-    # num_users = 32
-    # num_tx = 32  
-    # beam_dim = 2*num_tx*num_users # Beamformer vector dimension
-
-    # # d_model = 384 # Transformer single-token dimension
-    # # n_head = 12 # Number of attention heads
-    # # n_layers = 4 # Number of transformer layers
-
-    # # d_model = 448 # Transformer single-token dimension
-    # # n_head = 16 # Number of attention heads
-    # # n_layers = 5 # Number of transformer layers
-
-    # d_model = 512 # Transformer single-token dimension
-    # n_head = 16 # Number of attention heads
-    # n_layers = 6 # Number of transformer layers
-
-    # T = 1 # Number of time steps
-    # batch_size = 128 
-    # learning_rate = 1e-4
-    # weight_decay = 0.05
-    # max_epoch = 1500
-    # sigma2 = 1.0  
-    # SNR = 15
-    # SNR_power = 10 ** (SNR/10) # SNR power in dB
-    # attn_pdrop = 0.0
-    # # resid_pdrop = 0.05
-    # # attn_pdrop = 0.0
-    # resid_pdrop = 0.0
-    # mlp_ratio = 4
-    # subspace_dim = 4
-    # pbar_size = 1000
-
-   # Example configuration where num_users = num_tx = 20.
-    num_users = 20
-    num_tx = 20
-    d_model = 320 # Transformer single-token dimension
+    # Example configuration where num_users = num_tx = 16.
+    num_users = 32
+    num_tx = 32  
     beam_dim = 2*num_tx*num_users # Beamformer vector dimension
-    n_head = 10 # Number of attention heads
-    n_layers = 4 # Number of transformer layers
+
+    # d_model = 384 # Transformer single-token dimension
+    # n_head = 12 # Number of attention heads
+    # n_layers = 4 # Number of transformer layers
+
+    # d_model = 448 # Transformer single-token dimension
+    # n_head = 16 # Number of attention heads
+    # n_layers = 5 # Number of transformer layers
+
+    d_model = 512 # Transformer single-token dimension
+    n_head = 16 # Number of attention heads
+    n_layers = 6 # Number of transformer layers
+
     T = 1 # Number of time steps
-    batch_size = 128 
-    learning_rate = 3e-4
-    weight_decay = 0.01
-    max_epoch = 1000
+    batch_size = 32
+    learning_rate = 1e-5
+    weight_decay = 0.05
+    max_epoch = 1500
     sigma2 = 1.0  
     SNR = 15
     SNR_power = 10 ** (SNR/10) # SNR power in dB
@@ -764,9 +756,34 @@ if __name__ == "__main__":
     mlp_ratio = 4
     subspace_dim = 4
     pbar_size = 1000
-    start_degree = 4
-    degree_epoch = 50
-    degree_incre = 2
+    momentum = 0.9
+    nesterov = True  # Use Nesterov momentum
+
+#    # Example configuration where num_users = num_tx = 20.
+#     num_users = 20
+#     num_tx = 20
+#     d_model = 320 # Transformer single-token dimension
+#     beam_dim = 2*num_tx*num_users # Beamformer vector dimension
+#     n_head = 10 # Number of attention heads
+#     n_layers = 4 # Number of transformer layers
+#     T = 1 # Number of time steps
+#     batch_size = 128 
+#     learning_rate = 3e-4
+#     weight_decay = 0.01
+#     max_epoch = 1000
+#     sigma2 = 1.0  
+#     SNR = 15
+#     SNR_power = 10 ** (SNR/10) # SNR power in dB
+#     attn_pdrop = 0.0
+#     # resid_pdrop = 0.05
+#     # attn_pdrop = 0.0
+#     resid_pdrop = 0.0
+#     mlp_ratio = 4
+#     subspace_dim = 4
+#     pbar_size = 1000
+#     start_degree = 4
+#     degree_epoch = 50
+#     degree_incre = 2
 
     # # Example configuration where num_users = num_tx = 8.
     # num_users = 8
@@ -808,12 +825,14 @@ if __name__ == "__main__":
         resid_pdrop=resid_pdrop,
         mlp_ratio=mlp_ratio,
         subspace_dim=subspace_dim,
-        pbar_size=pbar_size
+        pbar_size=pbar_size,
+        momentum=momentum,
+        nesterov=nesterov
     )
 
-    model_path_stage_1 = f"{config.num_users}_{config.num_tx}_hybrid_attn_multi_layer/best_model.pt"
-    history_path_stage_1 = f"{config.num_users}_{config.num_tx}_hybrid_attn_multi_layer/saved_history.pt"
+    model_path_stage_1 = f"{config.num_users}_{config.num_tx}_hybrid_attn_multi_layer/best_model_6_blocks.pt"
+    history_path_stage_1 = f"{config.num_users}_{config.num_tx}_hybrid_attn_multi_layer/saved_history_6_blocks.pt"
     
     ### Train the beamforming transformer.
-    train_beamforming_transformer(config) ## first time training
-    # train_beamforming_transformer(config, pretrained_path=model_path_stage_1, history_path=history_path_stage_1) ## training with pretrained model/historical data
+    # train_beamforming_transformer(config) ## first time training
+    train_beamforming_transformer(config, pretrained_path=model_path_stage_1, history_path=history_path_stage_1) ## training with pretrained model/historical data
