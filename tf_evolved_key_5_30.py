@@ -114,11 +114,11 @@ class CrossAttentionBlock(nn.Module):
         # MLP block with an extra layer (scheme 2).
         self.mlp = nn.Sequential(
             nn.Linear(d_model, 4 * d_model),
-            # nn.LayerNorm(4 * d_model), # TBD
+            nn.LayerNorm(4 * d_model), # TBD
             nn.GELU(),
             nn.Dropout(resid_pdrop),
             nn.Linear(4 * d_model, 4 * d_model),  # additional layer
-            # nn.LayerNorm(4 * d_model), # TBD
+            nn.LayerNorm(4 * d_model), # TBD
             nn.GELU(),
             nn.Dropout(resid_pdrop),
             nn.Linear(4 * d_model, d_model),
@@ -445,18 +445,18 @@ def configure_optimizer(model, learning_rate, weight_decay):
     return optimizer
 
 
-def lr_lambda(epoch, config):
-    ## warm start
-    total_steps = config.max_epoch
-    warmup_steps = int(total_steps * 0.00)  
-    ## linearly increase the lr in the warm-up phase
-    if epoch < warmup_steps:
-        return math.sqrt(float(epoch) / float(max(1, warmup_steps)))   
-    ## cosine decay after warm-up
-    progress = float(epoch - warmup_steps) / float(max(1, total_steps - warmup_steps))
-    cosine_decay = 0.5 * (1.0 + math.cos(math.pi * progress)) ## 1 -> 0
-    # minimum learning rate: 0.05 * initial_lr
-    return max(0.2, cosine_decay)
+# def lr_lambda(epoch, config):
+#     ## warm start
+#     total_steps = config.max_epoch
+#     warmup_steps = int(total_steps * 0.00)  
+#     ## linearly increase the lr in the warm-up phase
+#     if epoch < warmup_steps:
+#         return math.sqrt(float(epoch) / float(max(1, warmup_steps)))   
+#     ## cosine decay after warm-up
+#     progress = float(epoch - warmup_steps) / float(max(1, total_steps - warmup_steps))
+#     cosine_decay = 0.5 * (1.0 + math.cos(math.pi * progress)) ## 1 -> 0
+#     # minimum learning rate: 0.05 * initial_lr
+#     return max(0.2, cosine_decay)
 
 
 def get_mmse_obj(H, W, sigma2=1.0):
@@ -465,6 +465,31 @@ def get_mmse_obj(H, W, sigma2=1.0):
     trace_real = th.stack([th.trace(prod).real for prod in prod])
     MSE_obj = fro_norm - trace_real
     return MSE_obj
+
+
+def custom_lr_scheduler(optimizer, config):
+    initial_lr = config.learning_rate
+    mid_lr = initial_lr * 0.5 ### very intricate here
+    final_lr = initial_lr * 0.15
+
+    def lr_lambda(epoch):
+        if epoch < config.mmse_epoch:
+            # Phase 1: Linear decay from initial_lr to mid_lr during supervised learning
+            decay_ratio = epoch / config.mmse_epoch
+            target_lr = initial_lr * (1 - decay_ratio) + mid_lr * decay_ratio
+            return target_lr / optimizer.param_groups[0]['initial_lr']
+        else:
+            # Phase 2: Cosine decay from mid_lr to final_lr during unsupervised learning
+            progress = float(epoch - config.mmse_epoch) / float(max(1, config.max_epoch - config.mmse_epoch))
+            cosine_factor = 0.5 * (1.0 + math.cos(math.pi * progress))  # 1→0
+            target_lr = mid_lr * cosine_factor + final_lr * (1 - cosine_factor)
+            return target_lr / optimizer.param_groups[0]['initial_lr']
+    
+    # Store the initial learning rate in the optimizer
+    for param_group in optimizer.param_groups:
+        param_group['initial_lr'] = initial_lr
+        
+    return th.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
 #############################################
 # 6. Training Routine
@@ -487,12 +512,14 @@ def train_beamforming_transformer(config, pretrained_path: str = None, history_p
     ###### optimizer and lr scheduler: scheme 1 (linearly decays lr)
     optimizer = configure_optimizer(model, config.learning_rate, config.weight_decay)
 
-    scheduler = th.optim.lr_scheduler.CosineAnnealingLR(
-        optimizer,
-        T_max=config.max_epoch,  
-        eta_min=config.learning_rate * 0.1  
-    )
-    # scheduler = th.optim.lr_scheduler.LambdaLR(optimizer, lambda epoch: 1 - 0.5 * (epoch / config.max_epoch))
+    scheduler = custom_lr_scheduler(optimizer, config)
+
+    # scheduler = th.optim.lr_scheduler.CosineAnnealingLR(
+    #     optimizer,
+    #     T_max=config.max_epoch,  
+    #     eta_min=config.learning_rate * 0.5 
+    # )
+    # scheduler = th.optim.lr_scheduler.LambdaLR(optimizer, lambda epoch: 1 - 0.5 * (epoch / config.max_epoch)) ### linearly decays lr
 
     # ####### optimizer and lr scheduler: scheme 2 (warm-start + cosine decay)
     # optimizer = configure_optimizer(model, config.learning_rate, config.weight_decay)
@@ -532,27 +559,19 @@ def train_beamforming_transformer(config, pretrained_path: str = None, history_p
     os.makedirs(save_dir, exist_ok=True)
     best_model_path = os.path.join(save_dir, "best_model.pt")
     
+    ### inherit the previous rate history, including the start_epoch
     for epoch in range(config.max_epoch):
 
-        # # cosine decay teacher weight.
-        # if epoch < 200:
-        #     teacher_weight = 0.9
-        # elif epoch < 700 and epoch >= 200:
-        #     progress = epoch - 200
-        #     decay_span = 500
-        #     teacher_weight = 0.45 * (1 + math.cos(math.pi * progress / decay_span))
-        # else:
-        #     teacher_weight = 0.0
-
         # # Soft switch learning policy.
-        # teacher_weight = max(0.0, 1 - (epoch / 200))
-        teacher_weight = 0.0  
+        teacher_weight = max(0.0, 1 - (epoch / config.mmse_epoch))  # Linearly decrease from 1 to 0
+        # teacher_weight = 0.0  
 
         epoch_loss = 0
         epoch_rate = 0
         pbar_batches = 0
         pbar = tqdm(dataloader, desc=f"Epoch {epoch+1}")
         max_rate = 0
+        epoch_grad_norm = 0
         for batch in pbar:
             # Channel input: shape (B, 2, num_users, num_tx)
             H_tensor = batch.to(device)
@@ -602,12 +621,21 @@ def train_beamforming_transformer(config, pretrained_path: str = None, history_p
             
             loss_unsupervised = - total_rate / config.T
             loss_supervised = total_mse_loss / config.T
-            loss = (1 - teacher_weight) * loss_unsupervised + (teacher_weight * 20000) * loss_supervised ## supervised MSE
-            # print((1 - teacher_weight) * loss_unsupervised.item(), (teacher_weight * 20000) * loss_supervised.item())
+            loss = (1 - teacher_weight) * loss_unsupervised + (teacher_weight * 10000) * loss_supervised ## supervised MSE
+            # print((1 - teacher_weight) * loss_unsupervised.item(), (teacher_weight * 7000) * loss_supervised.item())
             # bp()
             # loss = (1 - teacher_weight) * loss_unsupervised + (teacher_weight / 50) * loss_supervised ## supervised MSE
             optimizer.zero_grad()
             loss.backward()
+
+            with th.no_grad():
+                total_norm = th.tensor(0.0, device=device)
+                for p in model.parameters():
+                    if p.grad is not None:
+                        param_norm = p.grad.norm(2)
+                        total_norm += param_norm ** 2
+                current_grad_norm = th.sqrt(total_norm).item()
+                epoch_grad_norm += current_grad_norm
 
             # ### add gradient clipping
             # th.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
@@ -628,8 +656,9 @@ def train_beamforming_transformer(config, pretrained_path: str = None, history_p
         scheduler.step()
         current_lr = optimizer.param_groups[0]['lr']
         ave_pbar_rate = epoch_rate / pbar_batches
+        ave_grad_norm = epoch_grad_norm / pbar_batches
         test_pbar_rate = max_rate
-        print(f"Epoch {epoch+1} Average Sum Rate: {ave_pbar_rate:.4f}, Learning Rate: {current_lr:.2e}, teacher_weight: {teacher_weight:.2f}")
+        print(f"Epoch {epoch+1} Average Sum Rate: {ave_pbar_rate:.4f}, Learning Rate: {current_lr:.2e}, teacher_weight: {teacher_weight:.2f}, Gradient Norm: {ave_grad_norm:.4f}")
         ave_rate_history.append(th.tensor(ave_pbar_rate))
         test_rate_history.append(th.tensor(test_pbar_rate))
 
@@ -712,29 +741,30 @@ class BeamformerTransformerConfig:
         self.mlp_ratio = kwargs['mlp_ratio']
         self.subspace_dim = kwargs['subspace_dim']
         self.pbar_size = kwargs['pbar_size']
+        self.mmse_epoch = kwargs['mmse_epoch']
 
 if __name__ == "__main__":
 
-    # Example configuration where num_users = num_tx = 16.
-    num_users = 32
-    num_tx = 32  
-    beam_dim = 2*num_tx*num_users # Beamformer vector dimension
-    d_model = 512 # Transformer single-token dimension
-    n_head = 8 # Number of attention heads
-    n_layers = 6 # Number of transformer layers
-    T = 1 # Number of time steps
-    batch_size = 64 
-    learning_rate = 1e-4
-    weight_decay = 0.02
-    max_epoch = 1500
-    sigma2 = 1.0  
-    SNR = 15
-    SNR_power = 10 ** (SNR/10) # SNR power in dB
-    attn_pdrop = 0.0
-    resid_pdrop = 0.0
-    mlp_ratio = 4
-    subspace_dim = 4
-    pbar_size = 1000
+    # # Example configuration where num_users = num_tx = 16.
+    # num_users = 32
+    # num_tx = 32  
+    # beam_dim = 2*num_tx*num_users # Beamformer vector dimension
+    # d_model = 512 # Transformer single-token dimension
+    # n_head = 8 # Number of attention heads
+    # n_layers = 6 # Number of transformer layers
+    # T = 1 # Number of time steps
+    # batch_size = 64 
+    # learning_rate = 1e-4
+    # weight_decay = 0.02
+    # max_epoch = 1500
+    # sigma2 = 1.0  
+    # SNR = 15
+    # SNR_power = 10 ** (SNR/10) # SNR power in dB
+    # attn_pdrop = 0.0
+    # resid_pdrop = 0.0
+    # mlp_ratio = 4
+    # subspace_dim = 4
+    # pbar_size = 1000
 
     # # Example configuration where num_users = num_tx = 20.
     # num_users = 28
@@ -760,31 +790,27 @@ if __name__ == "__main__":
     # degree_epoch = 50
     # degree_incre = 2
     
-   # # Example configuration where num_users = num_tx = 20.
-   #  num_users = 20
-   #  num_tx = 20
-   #  d_model = 320 # Transformer single-token dimension
-   #  beam_dim = 2*num_tx*num_users # Beamformer vector dimension
-   #  n_head = 10 # Number of attention heads
-   #  n_layers = 4 # Number of transformer layers
-   #  T = 1 # Number of time steps
-   #  batch_size = 128 
-   #  learning_rate = 3e-4
-   #  weight_decay = 0.01
-   #  max_epoch = 1000
-   #  sigma2 = 1.0  
-   #  SNR = 15
-   #  SNR_power = 10 ** (SNR/10) # SNR power in dB
-   #  attn_pdrop = 0.0
-   #  # resid_pdrop = 0.05
-   #  # attn_pdrop = 0.0
-   #  resid_pdrop = 0.0
-   #  mlp_ratio = 4
-   #  subspace_dim = 4
-   #  pbar_size = 1000
-   #  start_degree = 4
-   #  degree_epoch = 50
-   #  degree_incre = 2
+   # Example configuration where num_users = num_tx = 20.
+    num_users = 20
+    num_tx = 20
+    d_model = 640 # Transformer single-token dimension
+    beam_dim = 2*num_tx*num_users # Beamformer vector dimension
+    n_head = 10 # Number of attention heads
+    n_layers = 5 # Number of transformer layers
+    T = 1 # Number of time steps
+    batch_size = 64
+    learning_rate = 2e-4
+    weight_decay = 0.02
+    max_epoch = 2000
+    sigma2 = 1.0  
+    SNR = 15
+    SNR_power = 10 ** (SNR/10) # SNR power in dB
+    attn_pdrop = 0.0
+    resid_pdrop = 0.0
+    mlp_ratio = 4
+    subspace_dim = 4
+    pbar_size = 500
+    mmse_epoch = 200  # Epoch incorporating mmse supervision
 
     # # Example configuration where num_users = num_tx = 8.
     # num_users = 8
@@ -826,12 +852,13 @@ if __name__ == "__main__":
         resid_pdrop=resid_pdrop,
         mlp_ratio=mlp_ratio,
         subspace_dim=subspace_dim,
-        pbar_size=pbar_size
+        pbar_size=pbar_size,
+        mmse_epoch=mmse_epoch
     )
 
     model_path_stage_1 = f"{config.num_users}_{config.num_tx}_hybrid_attn_multi_layer/best_model_6_1.pt"
     history_path_stage_1 = f"{config.num_users}_{config.num_tx}_hybrid_attn_multi_layer/saved_history_6_1.pt"
     
     ### Train the beamforming transformer.
-    # train_beamforming_transformer(config) ## first time training
-    train_beamforming_transformer(config, pretrained_path=model_path_stage_1, history_path=history_path_stage_1) ## training with pretrained model/historical data
+    train_beamforming_transformer(config) ## first time training
+    # train_beamforming_transformer(config, pretrained_path=model_path_stage_1, history_path=history_path_stage_1) ## training with pretrained model/historical data
