@@ -469,7 +469,7 @@ def get_mmse_obj(H, W, sigma2=1.0):
 
 def custom_lr_scheduler(optimizer, config):
     initial_lr = config.learning_rate
-    mid_lr = initial_lr * 0.5 ### very intricate here
+    mid_lr = initial_lr * 0.3 ### very intricate here
     final_lr = initial_lr * 0.15
 
     def lr_lambda(epoch):
@@ -498,11 +498,11 @@ def train_beamforming_transformer(config, pretrained_path: str = None, history_p
     """
     Train the beamforming transformer based on the given configuration.
     """
-    dataset = ChannelDataset(num_samples=config.pbar_size * config.batch_size,
-                             num_users=config.num_users,
-                             num_tx=config.num_tx,
-                             P=config.SNR_power)
-    dataloader = DataLoader(dataset, batch_size=config.batch_size, shuffle=True)
+    # dataset = ChannelDataset(num_samples=config.pbar_size * config.batch_size,
+    #                          num_users=config.num_users,
+    #                          num_tx=config.num_tx,
+    #                          P=config.SNR_power)
+    # dataloader = DataLoader(dataset, batch_size=config.batch_size, shuffle=True)
     
     device = th.device("cuda" if th.cuda.is_available() else "cpu")
 
@@ -561,6 +561,12 @@ def train_beamforming_transformer(config, pretrained_path: str = None, history_p
     
     ### inherit the previous rate history, including the start_epoch
     for epoch in range(config.max_epoch):
+
+        dataset = ChannelDataset(num_samples=config.pbar_size * config.batch_size,
+                             num_users=config.num_users,
+                             num_tx=config.num_tx,
+                             P=config.SNR_power)
+        dataloader = DataLoader(dataset, batch_size=config.batch_size, shuffle=True)
 
         # # Soft switch learning policy.
         teacher_weight = max(0.0, 1 - (epoch / config.mmse_epoch))  # Linearly decrease from 1 to 0
