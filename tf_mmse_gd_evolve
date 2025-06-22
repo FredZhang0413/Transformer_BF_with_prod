@@ -1,0 +1,802 @@
+
+import math
+import torch as th
+import torch.nn as nn
+import torch.optim as optim
+import torch.nn.functional as F
+import numpy as np
+from torch.utils.data import DataLoader, Dataset
+from tqdm import tqdm
+# from baseline_mmse import compute_mmse_beamformer
+from pdb import set_trace as bp
+import torch.nn.functional as fun
+import matplotlib.pyplot as plt
+import warnings
+warnings.filterwarnings("ignore")
+
+import os
+
+mse_loss_fn = nn.MSELoss()
+device = th.device("cuda:0" if th.cuda.is_available() else "cpu")
+
+## wmmse: 74.48693517604116；ZF: 64.0581446998507 (24*24 Gaussian channel)
+## wmmse: 52.07755418089099；ZF: 43.94968651013214 (16*16 Gaussian channel)
+## wmmse: 27.24612893140909；ZF: 21.29116212713009 (8*8 Gaussian channel)
+## wmmse: 14.27623317904294；ZF: 12.13094550542433 (4*4 Gaussian channel)
+
+##### 1. already tried
+### consider learning rate scheduler (works)
+### consider hard switch learning policy (done)
+### consider subspace curriculum learning strategy (uncertain)
+### consider increasing the episode length T (10-15)
+### consider using the objective CL (works)
+### T = 1, try no L2O (it works when objective CL is used)
+### consider remove the weight decay in optimizer (slight improve?)
+### consider tweaking the MLP modules (slight improve, without layernorm)
+
+
+##### 2. waiting for the trial
+### consider the contrastive learning (improtant!)
+### self attention vs cross attention (important)
+### consider using the hybrid-supervision training strategy
+
+
+### select the optimal transformer block number and head number (ongoing)
+### Do attentions within H, W and HW
+### gradient clipping?
+### meta-learning (MAML) / reptile method
+### entropy regularization, force a wider solution space
+### trust region method (TRM)
+### optimzation restart 
+
+### focus on the problem: the gradient is too sparse
+
+
+###### 3. seems infeasible
+### consider noise injection
+### consider the learning rate warm-up at the early stage
+### consider random initialization of the beamformer
+
+
+
+#############################################
+# 1. System performance: sum rate for multi-user MISO
+#############################################
+def sum_rate(H, W, sigma2=1.0):
+    prod = th.bmm(H, W)  # (B, num_users, num_users)
+    signal_power = th.abs(th.diagonal(prod, dim1=-2, dim2=-1))**2
+    interference = th.sum(th.abs(prod)**2, dim=-1) - signal_power
+    N = sigma2
+    SINR = signal_power / (interference + N)  # (B, num_users)
+    reward = th.log2(1 + SINR).sum(dim=-1).mean()
+    return reward
+
+def compute_mmse_beamformer(mat_H, K, N, P, noise_power=1, device=th.device("cuda:0" if th.cuda.is_available() else "cpu")):
+    P = th.diag_embed(th.ones(mat_H.shape[0], 1, device=device).repeat(1, K)).to(th.cfloat) ## (B, K, K)
+    eye_N = th.diag_embed((th.zeros(mat_H.shape[0], N, device=device) + noise_power))
+    denominator = th.inverse(eye_N + th.bmm(mat_H.conj().transpose(1,2), th.bmm(P / K, mat_H)))
+    wslnr_max = th.bmm(denominator, mat_H.conj().transpose(1,2)).transpose(1,2)
+    wslnr_max = wslnr_max / wslnr_max.norm(dim=2, keepdim=True)
+    mat_W = th.bmm(wslnr_max, th.sqrt(P/ K))
+    mat_HW = th.bmm(mat_H, mat_W.transpose(-1, -2))
+    S = th.abs(th.diagonal(mat_HW, dim1=-2, dim2=-1))**2
+    I = th.sum(th.abs(mat_HW)**2, dim=-1) - th.abs(th.diagonal(mat_HW, dim1=-2, dim2=-1))**2
+    N = noise_power
+    SINR = S/(I+N)
+    return mat_W, th.log2(1+SINR).sum(dim=-1).unsqueeze(-1)
+
+#############################################
+# Single L2O Block: multi-head self‐attention
+#############################################
+class MultiHeadAttention(nn.Module): ### self-attention version
+    def __init__(self, token_dim, seq_len, d_model, embed_dim, num_heads, dropout):
+        """
+        d_model: dimension of each token (D)
+        num_heads: number of attention heads (h)
+        dropout:   dropout on attention weights and output
+        """
+        super().__init__()
+        assert d_model % num_heads == 0, "d_model must be divisible by num_heads"
+        self.token_dim = token_dim # N / K (user_level / antenna_level)
+        self.seq_len = seq_len # 4K / 4N (user_level / antenna_level)
+        self.num_tokens_h = seq_len // 2  # number of tokens in the H-stream (here 2*K or 2*N)
+        self.d_model = d_model # token dimension when using the multi-head attention
+        self.num_heads = num_heads # number of attention heads
+        self.head_dim = d_model // num_heads # dimension of each head (d)
+        self.embed_dim = embed_dim
+
+        self.embedding = nn.Linear(token_dim, embed_dim)  # embedding layer to project input tokens to d_model dimension
+        self.x_ln = nn.LayerNorm(embed_dim)  # LayerNorm for input tokens
+
+        # linear projections for Q, K, V
+        self.q_proj = nn.Linear(embed_dim, d_model)
+        self.k_proj = nn.Linear(embed_dim, d_model)
+        self.v_proj = nn.Linear(embed_dim, d_model)
+
+        self.head_collect = nn.Linear(d_model, embed_dim)  # linear projection to collect heads
+
+        self.attn_drop = nn.Dropout(dropout)
+        self.proj_drop = nn.Dropout(dropout)
+
+    ### initial size of x: [B, ]
+    def forward(self, x):
+        """
+        x: (B, L, D)
+        returns: (B, L, D)
+        """
+        B, L, D = x.shape ## L = 4K, D = token_dim
+        h, d = self.num_heads, self.head_dim  ## d_model = h * d
+        x_embed = self.embedding(x)  # (B, L, D) -> (B, L, embed_dim)
+
+        x_ln = self.x_ln(x_embed) # LayerNorm for input tokens   
+
+        # 1) project to Q,K,V and reshape for multi-head:
+        #    -> (B, L, h, d) -> (B, h, L, d)
+        Q = self.q_proj(x_ln).view(B, L, h, d).transpose(1, 2)
+        K = self.k_proj(x_ln).view(B, L, h, d).transpose(1, 2)
+        V = self.v_proj(x_ln).view(B, L, h, d).transpose(1, 2)
+
+        # 2) scaled dot-product attention scores
+        #    scores: (B, h, L, L)
+        scores = (Q @ K.transpose(-2, -1)) / math.sqrt(d)
+        attn = F.softmax(scores, dim=-1)
+        attn = self.attn_drop(attn)
+
+        # 3) attend to V -> (B, h, L, d)
+        context = attn @ V
+        # 4) merge heads -> (B, L, h, d) -> (B, L, D)
+        context = context.transpose(1, 2).contiguous().view(B, L, h*d) ## (B, L, d_model)
+        context = self.head_collect(context)  # (B, L=4K, embed_dim)
+        y_h_mlp = context[:, :self.num_tokens_h, :] + x_embed[:, :self.num_tokens_h, :]  # (B, 2K, embed_dim)
+        y_w_mlp = context[:, self.num_tokens_h:, :] + x_embed[:, self.num_tokens_h:, :] # (B, 2K, embed_dim)
+
+        return y_h_mlp, y_w_mlp ## output features of attention block
+
+#############################################
+# Single L2O Block: two-level MLP / FC
+#############################################
+# class MultiHeadSelfAttention(nn.Module):
+#     def __init__(self, token_dim, seq_len, d_model, num_heads, dropout):
+
+### input X_user, X_ant: shape (B, 4*K, N)
+### ouptut y_h_next, y_w_next: shape (B, 2K, token_dim) and (B, 2N, token_dim)
+class TransformerBlock(nn.Module):
+    def __init__(self, token_dim, seq_len, n_head, resid_pdrop, embed_dim, config):
+        super(TransformerBlock, self).__init__()
+        d_model = config.d_model
+        n_head = config.n_head
+        assert d_model % n_head == 0, "d_model must be divisible by n_head"     
+        # Set dimensions
+        self.K = config.num_users   # Number of users
+        self.N = config.num_tx      # Number of transmit antennas
+        self.num_tokens_h = 2 * self.K  # number of tokens in the H-stream (here 2*K)
+        self.num_tokens_w = 2 * self.N  # number of tokens in the W-stream (here 2*N)
+
+        # single-layer at first
+        self.self_attn_user = MultiHeadAttention(
+            token_dim=token_dim, seq_len=seq_len, d_model=d_model, embed_dim=embed_dim, num_heads=n_head, dropout=resid_pdrop
+        )
+
+        self.self_attn_ant = MultiHeadAttention(
+            token_dim=token_dim, seq_len=seq_len, d_model=d_model, embed_dim=embed_dim, num_heads=n_head, dropout=resid_pdrop
+        )
+
+        #### layernorm before MLP and FC layers
+        self.y_h_ln = nn.LayerNorm(embed_dim)  # LayerNorm for H-stream output
+        self.y_w_ln = nn.LayerNorm(embed_dim)  # LayerNorm for W-stream output
+
+        self.mlp_h = nn.Sequential(
+            nn.Linear(embed_dim, 4 * embed_dim),
+            nn.LayerNorm(4 * embed_dim), # TBD
+            nn.GELU(),
+            nn.Dropout(resid_pdrop),
+            nn.Linear(4 * embed_dim, 4 * embed_dim),  # additional layer
+            nn.LayerNorm(4 * embed_dim), # TBD
+            nn.GELU(),
+            nn.Dropout(resid_pdrop),
+            nn.Linear(4 * embed_dim, embed_dim),
+            nn.Dropout(resid_pdrop),
+        )
+
+        self.mlp_w = nn.Sequential(
+            nn.Linear(embed_dim, 4 * embed_dim),
+            nn.LayerNorm(4 * embed_dim), # TBD
+            nn.GELU(),
+            nn.Dropout(resid_pdrop),
+            nn.Linear(4 * embed_dim, 4 * embed_dim),  # additional layer
+            nn.LayerNorm(4 * embed_dim), # TBD
+            nn.GELU(),
+            nn.Dropout(resid_pdrop),
+            nn.Linear(4 * embed_dim, embed_dim),
+            nn.Dropout(resid_pdrop),
+        )
+
+        self.fc_h = nn.Linear(embed_dim, token_dim)  # FC for H-stream output
+        self.fc_w = nn.Linear(embed_dim, token_dim)  # FC for W-stream output
+
+    def forward(self, X_user, X_ant):
+        """
+        Args:
+          X_user: concatenated [H;W] tokens, shape (B, 4*K, N), 4*K = 2*num_tokens_h
+          X_ant: concatenated [H^T;W^T] tokens, shape (B, 4*N, K), 4*N = 2*num_tokens_w
+        Returns:
+          y_h_next: output features for H-stream, shape (B, 2K, token_dim)
+          y_w_next: output features for W-stream, shape (B, 2N, token_dim)
+        """
+        # 1) Self‐attention + residual + norm
+        y_h_mlp_user, y_w_mlp_user = self.self_attn_user(X_user)  # (B, 2K, token_dim)
+        y_h_mlp_ant, y_w_mlp_ant = self.self_attn_ant(X_ant) # (B, 2N, token_dim)
+
+        # y_h_mlp = th.cat([y_h_mlp_user, y_h_mlp_ant], dim=1)  # (B, 2K+2N, token_dim)
+        # y_w_fc = th.cat([y_w_fc_user, y_w_fc_ant], dim=1)      # (B, 2K+2N, token_dim)
+
+        y_h_mlp = y_h_mlp_user + y_h_mlp_ant  # (B, 2K, token_dim)
+        y_w_mlp = y_w_mlp_user + y_w_mlp_ant      # (B, 2N, token_dim)
+
+        y_h_mlp_ln = self.y_h_ln(y_h_mlp)  # LayerNorm for H-stream output
+        y_h_mlp_out = self.mlp_h(y_h_mlp_ln)  # MLP for H-stream output, size (B, 2K+2N, token_dim)
+        y_h_out = y_h_mlp + y_h_mlp_out # (B, 2K, token_dim)  # residual connection
+        y_h_next = self.fc_h(y_h_out)  # FC for H-stream output, size (B, 2K, token_dim)
+
+        # y_w_fc_ln = self.y_w_ln(y_w_fc)  # LayerNorm for W-stream output
+        # y_w_out = self.fc_w(y_w_fc_ln)  # FC for W-stream output, size (B, 2N, token_dim)
+
+        y_w_mlp_ln = self.y_w_ln(y_w_mlp)  # LayerNorm for W-stream output
+        y_w_out = self.mlp_w(y_w_mlp_ln)  # MLP for W-stream output, size (B, 2N, token_dim)
+        y_w_out = y_w_mlp + y_w_out  # residual connection
+        y_w_out = self.fc_w(y_w_out)  # FC for W-stream output, size (B, 2N, token_dim)
+
+        y_w_flat = y_w_out.reshape(y_w_out.shape[0], -1)  # flatten W-stream output to (B, beam_dim)
+        norm = th.norm(y_w_flat, dim=1, keepdim=True)  # normalize W-stream output
+        y_w_flat = y_w_flat / norm #(B, beam_dim)
+        y_w_next = y_w_flat.reshape(y_w_out.shape[0], self.num_tokens_w, -1)  # reshape to (B, 2N, token_dim)
+
+        return y_h_next, y_w_next
+
+
+#############################################
+# 2. Full L2O Transformer: T stacked blocks
+#############################################
+# class TransformerBlock(nn.Module):
+#     def __init__(self, token_dim, seq_len, n_head, resid_pdrop, embed_dim, config):
+
+class L2OTransformer(nn.Module):
+    def __init__(self, config):
+        """
+        Stacks T TransformerBlocks to produce an optimization trajectory.
+        """
+        super(L2OTransformer, self).__init__()
+        self.K = config.num_users
+        self.N = config.num_tx
+        token_dim = config.num_tx  # embedding dimension
+        seq_len = 4 * self.K  # sequence length for user-level tokens (2*K) or antenna-level tokens (2*N)
+        # embedding dimension == num_tx
+        self.num_tokens_h = 2 * self.K  # number of tokens in the H-stream (here 2*K)
+        self.num_tokens_w = 2 * self.N  # number of tokens in the W-stream (here 2*N)
+
+        # build n_layers identical blocks
+        self.mhsa_blocks = nn.ModuleList([
+            TransformerBlock(token_dim=token_dim, seq_len=seq_len, n_head=config.n_head, resid_pdrop=config.resid_pdrop, embed_dim=config.embed_dim, config=config)
+        for _ in range(config.n_layers)])
+
+        # Weight initialization.
+        self.apply(self._init_weights)
+        print(f"Number of parameters: {sum(p.numel() for p in self.parameters()):,}")
+    
+    def _init_weights(self, module):
+        if isinstance(module, nn.Linear):
+            nn.init.normal_(module.weight, mean=0.0, std=0.02)
+            if module.bias is not None:
+                nn.init.zeros_(module.bias)
+        elif isinstance(module, nn.LayerNorm):
+            nn.init.zeros_(module.bias)
+            nn.init.ones_(module.weight)
+        elif isinstance(module, nn.Embedding):
+            nn.init.normal_(module.weight, mean=0.0, std=0.02)
+
+    def forward(self, H, W_prev):
+        """
+        Args:
+          H:      complex channel matrix (B,K,N)
+          W_prev:     complex MMSE beamformer (B,K,N)
+        Returns:
+          H_traj: list of real/imag-concatenated channel features per step
+          W_traj: list of real/imag-concatenated solutions per step
+        """
+        B = H.size(0)
+        K = self.K  # Number of users
+        N = self.N  # Number of transmit antennas
+
+        H_user = th.cat([H.real, H.imag], dim=1)  # (B, 2*K, N)
+        W_user = th.cat([W_prev.real, W_prev.imag], dim=1)  # (B, 2*K, N)
+        X_user = th.cat([H_user, W_user], dim=1)  # (B, 4*K, N)
+
+        H_ant = th.cat([H.real.transpose(1, 2), H.imag.transpose(1, 2)], dim=1)  # (B, 2*N, K)
+        W_ant = th.cat([W_prev.real.transpose(1, 2), W_prev.imag.transpose(1, 2)], dim=1)  # (B, 2*N, K)
+        X_ant = th.cat([H_ant, W_ant], dim=1)  # (B, 4*N, K)
+
+        H_traj, W_traj = [], [] ## lists to store the trajectory of solutions
+        for block in self.mhsa_blocks:
+            y_h_next, y_w_next = block(X_user, X_ant)  # (B, 2K, N) and (B, 2K, N)
+            H_sol = y_h_next[:, :K, :] + 1j * y_h_next[:, K:, :]  # (B, K, N) -> complex channel features
+            W_sol = y_w_next[:, :K, :] + 1j * y_w_next[:, K:, :]  # (B, K, N) -> complex beamformer
+            H_traj.append(H_sol)  
+            W_traj.append(W_sol)
+            H_user_update = th.cat([H_sol.real, H_sol.imag], dim=1)  # (B, 2*K, N)
+            W_user_update = th.cat([W_sol.real, W_sol.imag], dim=1)  # (B, 2*K, N)
+            X_user = th.cat([H_user_update, W_user_update], dim=1) # (B, 4*K, N)
+            H_ant_update = th.cat([H_sol.real.transpose(1, 2), H_sol.imag.transpose(1, 2)], dim=1)  # (B, 2*N, K)
+            W_ant_update = th.cat([W_sol.real.transpose(1, 2), W_sol.imag.transpose(1, 2)], dim=1)  # (B, 2*N, K)
+            X_ant = th.cat([H_ant_update, W_ant_update], dim=1)  # (B, 4*N, K)  
+        W_pred = W_sol # (B, K, N) -> final predicted beamformer
+        return H_traj, W_traj, W_pred  # return the trajectory of channel features and beamformers, and final predicted beamformer
+
+
+#############################################
+# 5. Channel dataset: random Gaussian H
+#############################################
+class ChannelDataset(Dataset):
+    def __init__(self, num_samples, num_users, num_tx, P):
+        self.num_samples = num_samples
+        self.num_users = num_users
+        self.num_tx = num_tx
+        self.P = P
+        ### pre-generate the channel matrix
+        self.data = th.randn(num_samples, 2, num_users, num_tx, dtype=th.float32, device=device) * (math.sqrt(2) / 2)  # Shape: (num_samples, 2, num_users, num_tx)
+        self.data = self.data * (P ** 0.5)
+        
+    def __len__(self):
+        return self.num_samples
+    
+    def __getitem__(self, idx):
+        return self.data[idx]  # Shape: (2, num_users, num_tx)
+
+
+#############################################
+# 5. Optimizer configuration
+#############################################
+
+def configure_optimizer(model, learning_rate, weight_decay):
+    """
+    Configure optimizer with selective weight decay for linear and conv2d layers.
+    """
+    decay_params = []
+    no_decay_params = []
+    
+    for name, param in model.named_parameters():
+        if not param.requires_grad:
+            continue
+        if any(layer_type in name for layer_type in ['linear', 'conv', 'fc', 'weight']):
+            if not any(exclude in name for exclude in ['ln', 'norm', 'layernorm', 'emb', 'embedding', 'bias']):
+                decay_params.append(param)
+                continue
+        no_decay_params.append(param)
+    
+    optimizer_grouped_parameters = [
+        {'params': decay_params, 'weight_decay': weight_decay},
+        {'params': no_decay_params, 'weight_decay': 0.0}
+    ]
+    
+    optimizer = th.optim.AdamW(optimizer_grouped_parameters, lr=learning_rate)
+    return optimizer
+
+
+# def lr_lambda(epoch, config):
+#     ## warm start
+#     total_steps = config.max_epoch
+#     warmup_steps = int(total_steps * 0.00)  
+#     ## linearly increase the lr in the warm-up phase
+#     if epoch < warmup_steps:
+#         return math.sqrt(float(epoch) / float(max(1, warmup_steps)))   
+#     ## cosine decay after warm-up
+#     progress = float(epoch - warmup_steps) / float(max(1, total_steps - warmup_steps))
+#     cosine_decay = 0.5 * (1.0 + math.cos(math.pi * progress)) ## 1 -> 0
+#     # minimum learning rate: 0.05 * initial_lr
+#     return max(0.2, cosine_decay)
+
+
+def get_mmse_obj(H, W, sigma2=1.0):
+    prod = th.bmm(H, W)  # (B, num_users, num_users)
+    fro_norm = th.norm(prod, p='fro', dim=(1,2)) ** 2
+    trace_real = th.stack([th.trace(prod).real for prod in prod])
+    MSE_obj = fro_norm - trace_real
+    return MSE_obj
+
+
+def custom_lr_scheduler(optimizer, config):
+    initial_lr = config.learning_rate
+    mid_lr = initial_lr * 0.3 ### very intricate here
+    final_lr = initial_lr * 0.15
+
+    def lr_lambda(epoch):
+        if epoch < config.mmse_epoch:
+            # Phase 1: Linear decay from initial_lr to mid_lr during supervised learning
+            decay_ratio = epoch / config.mmse_epoch
+            target_lr = initial_lr * (1 - decay_ratio) + mid_lr * decay_ratio
+            return target_lr / optimizer.param_groups[0]['initial_lr']
+        else:
+            # Phase 2: Cosine decay from mid_lr to final_lr during unsupervised learning
+            progress = float(epoch - config.mmse_epoch) / float(max(1, config.max_epoch - config.mmse_epoch))
+            cosine_factor = 0.5 * (1.0 + math.cos(math.pi * progress))  # 1→0
+            target_lr = mid_lr * cosine_factor + final_lr * (1 - cosine_factor)
+            return target_lr / optimizer.param_groups[0]['initial_lr']
+    
+    # Store the initial learning rate in the optimizer
+    for param_group in optimizer.param_groups:
+        param_group['initial_lr'] = initial_lr
+        
+    return th.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
+
+#############################################
+# 6. Training Routine
+#############################################
+def train_beamforming_transformer(config, pretrained_path: str = None, history_path: str = None):
+    """
+    Train the beamforming transformer based on the given configuration.
+    """
+  
+    device = th.device("cuda" if th.cuda.is_available() else "cpu")
+
+    # 1) Instantiate the model
+    model = L2OTransformer(config).to(device)
+
+    ###### optimizer and lr scheduler: scheme 1 (linearly decays lr)
+    optimizer = configure_optimizer(model, config.learning_rate, config.weight_decay)
+
+    scheduler = custom_lr_scheduler(optimizer, config)
+
+    # 2) Optionally load pretrained weights
+    if pretrained_path is not None:
+        checkpoint = th.load(pretrained_path, map_location=device)
+        model.load_state_dict(checkpoint['model_state_dict'])
+        print(f"Loaded pretrained weights from {pretrained_path}")
+        # optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+        # scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+
+    # 3) Optionally load pre-stored history
+    if history_path is not None and pretrained_path is not None:
+        saved_history = th.load(history_path)
+        rate_history = saved_history.get('rate_history', [])
+        ave_rate_history = saved_history.get('ave_rate_history', [])
+        test_rate_history = saved_history.get('test_rate_history', [])
+        start_epoch_prev = saved_history.get('start_epoch', 0) 
+        print(f"Resuming from epoch {start_epoch_prev}")
+    else:
+        rate_history = []
+        ave_rate_history = []
+        test_rate_history = []
+        start_epoch_prev = 0
+  
+    global mmse_rate_printed
+    mmse_rate_printed = False
+    model.train()
+
+    # save_dir = f"{config.num_users}_{config.num_tx}_6_5_store"
+    # os.makedirs(save_dir, exist_ok=True)
+    # best_model_path = os.path.join(save_dir, "best_model.pt")
+
+    best_model_path = "best_model.pt"
+    
+    ### inherit the previous rate history, including the start_epoch
+    for epoch in range(start_epoch_prev, config.max_epoch):
+
+        dataset = ChannelDataset(num_samples=config.pbar_size * config.batch_size, num_users=config.num_users, num_tx=config.num_tx, P=config.SNR_power)
+        dataloader = DataLoader(dataset, batch_size=config.batch_size, shuffle=True)
+
+        # # Soft switch learning policy.
+        teacher_weight = max(0.0, 0.8 - (epoch / config.mmse_epoch))  # Linearly decrease from 1 to 0
+        # teacher_weight = 0.0  
+
+        epoch_loss = 0
+        epoch_rate = 0
+        epoch_max_rate = 0
+        pbar_batches = 0
+        pbar = tqdm(dataloader, desc=f"Epoch {epoch+1}")
+        max_rate = 0
+        epoch_grad_norm = 0
+        for batch in pbar:
+            # Channel input: shape (B, 2, num_users, num_tx)
+            H_tensor = batch.to(device)
+            # Convert to complex channel matrix: (B, num_users, num_tx)
+            H_mat = H_tensor[:, 0, :, :] + 1j * H_tensor[:, 1, :, :]
+            
+            # Compute initial beamformer using MMSE.
+            W0, _ = compute_mmse_beamformer(H_mat, config.num_users, config.num_tx, config.SNR_power, config.sigma2, device)
+            W0 = W0.transpose(-1, -2).to(device)  # (B, num_tx, num_users)
+            vec_w0 = th.cat((th.real(W0).reshape(-1, config.num_tx * config.num_users), th.imag(W0).reshape(-1, config.num_tx * config.num_users)), dim=-1)
+            vec_w0 = vec_w0.reshape(-1, 2 * config.num_tx * config.num_users)
+            norm_W0 = th.norm(vec_w0, dim=1, keepdim=True)
+            normlized_W0 = vec_w0 / norm_W0
+            # Reconstruct complex beamformer: (B, num_tx, num_users)
+            W_mat_0 = (normlized_W0[:, :config.num_tx * config.num_users].reshape(-1, config.num_tx, config.num_users) + 1j * normlized_W0[:, config.num_tx * config.num_users:].reshape(-1, config.num_tx, config.num_users))
+            
+            # Initialize W_prev (transpose to get shape (B, num_users, num_tx)).
+            W_prev = W_mat_0.transpose(-1, -2).to(device)
+            total_rate = 0
+            total_mse_loss = 0
+            final_rate = 0
+
+            ### save more time by not computing the MMSE beamformer at the later stage
+            if teacher_weight > 0.0:
+
+                W_pre_update = W_mat_0.clone().requires_grad_(True) 
+                for _ in range(config.pgd_steps):
+                    loss_inner = sum_rate(H_mat, W_pre_update, sigma2=config.sigma2)  # (B, num_tx, num_users)
+                    grad_w = th.autograd.grad(loss_inner, W_pre_update, create_graph=True)[0]  ## maintain second-order gradient
+                    W_pre_update = (W_pre_update + config.pgd_step_size * grad_w)  # (B, num_tx, num_users)
+                    # Normalize the pre-update beamformer.
+                    vec_w_pre_update = th.cat((th.real(W_pre_update).reshape(-1, config.num_tx * config.num_users), th.imag(W_pre_update).reshape(-1, config.num_tx * config.num_users)), dim=-1).reshape(-1, 2 * config.num_tx * config.num_users)
+                    vec_w_pre_update = vec_w_pre_update / th.norm(vec_w_pre_update, dim=1, keepdim=True)  # Normalize
+                    W_pre_update = (vec_w_pre_update[:, :config.num_tx * config.num_users].reshape(-1, config.num_tx, config.num_users) + 1j * vec_w_pre_update[:, config.num_tx * config.num_users:].reshape(-1, config.num_tx, config.num_users))
+                W_update = W_pre_update
+                vec_w_updated = th.cat((th.real(W_update).reshape(-1, config.num_tx * config.num_users), th.imag(W_update).reshape(-1, config.num_tx * config.num_users)), dim=-1)
+
+                rate_0 = sum_rate(H_mat, W_update, sigma2=config.sigma2)
+                if not mmse_rate_printed:
+                    mmse_rate_printed = True
+                    print(f"MMSE Rate: {rate_0.item():.4f}")
+                    
+                # The model predicts the next beamformer.
+                _, W_traj, W_pred = model(H_mat, W_prev)  # (B, beam_dim)
+                for i in range(len(W_traj)):
+                    W_mat = W_traj[i].transpose(-1, -2).to(device)  # (B, num_tx, num_users)
+                    rate = sum_rate(H_mat, W_mat, sigma2=config.sigma2)
+                    final_rate = max(final_rate, rate.item())
+                    total_rate += rate
+
+                    vec_w_mat = th.cat((th.real(W_mat).reshape(-1, config.num_tx * config.num_users), th.imag(W_mat).reshape(-1, config.num_tx * config.num_users)), dim=-1).reshape(-1, 2 * config.num_tx * config.num_users)              
+                    # mse_loss = fun.mse_loss(vec_w_mat, normlized_W0) 
+                    mse_loss = fun.mse_loss(vec_w_mat, vec_w_updated)
+                    total_mse_loss += mse_loss
+
+                    # ### unsupervised MSE loss
+                    # mse_loss = get_mmse_obj(H_mat, W_mat, sigma2=config.sigma2)   
+                    # total_mse_loss += mse_loss.mean() 
+
+                #final_rate = sum_rate(H_mat, W_pred.transpose(-1,-2), sigma2=config.sigma2)
+             
+                loss_unsupervised = - total_rate 
+                loss_supervised = total_mse_loss
+                # loss_update = - total_rate_update / config.T
+
+                loss = (1 - teacher_weight) * loss_unsupervised + (teacher_weight * 20000) * loss_supervised ## supervised MSE
+                #loss = (1 - teacher_weight) * loss_unsupervised + (teacher_weight / 50) * loss_supervised ## unsupervised MSE
+                # print((1 - teacher_weight) * loss_unsupervised.item(), (teacher_weight * 30000) * loss_supervised.item())
+                # bp()
+
+            else:
+                _, W_traj, W_pred = model(H_mat, W_prev)  # (B, beam_dim)
+                for i in range(len(W_traj)):
+                    W_mat = W_traj[i].transpose(-1, -2).to(device)  # (B, num_tx, num_users)
+                    rate = sum_rate(H_mat, W_mat, sigma2=config.sigma2)
+                    final_rate = max(final_rate, rate.item())
+                    total_rate += rate                                            
+                loss = - total_rate
+                # final_rate = sum_rate(H_mat, W_pred.transpose(-1,-2), sigma2=config.sigma2)
+
+            optimizer.zero_grad()
+            loss.backward()
+
+            with th.no_grad():
+                total_norm = th.tensor(0.0, device=device)
+                for p in model.parameters():
+                    if p.grad is not None:
+                        param_norm = p.grad.norm(2)
+                        total_norm += param_norm ** 2
+                current_grad_norm = th.sqrt(total_norm).item()
+                epoch_grad_norm += current_grad_norm
+
+            # ### add gradient clipping
+            # th.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            ### test gradient values
+            th.nn.utils.clip_grad_norm_(model.parameters(), max_norm=200.0)
+            # print(f"Gradient norm: {grad_norm:.4f}\n")
+
+            optimizer.step()
+
+            ave_rate = total_rate.item() / len(W_traj)
+            epoch_loss += loss.item()
+            epoch_rate += ave_rate
+            epoch_max_rate += final_rate
+            rate_history.append(th.tensor(ave_rate))
+            pbar_batches += 1
+            pbar.set_description(f"Epoch {epoch+1}, Avg Rate: {ave_rate:.4f}, Max Rate: {final_rate:.4f}")
+            # pbar.set_description(f"Epoch {epoch+1}, Avg Rate: {ave_rate:.4f}, Update Rate: {ave_rate_update:.4f}")
+        
+        scheduler.step()
+        current_lr = optimizer.param_groups[0]['lr']
+        ave_pbar_rate = epoch_rate / pbar_batches
+        ave_pbar_max_rate = epoch_max_rate / pbar_batches
+        ave_grad_norm = epoch_grad_norm / pbar_batches
+        print(f"Epoch {epoch+1} Average Sum Rate: {ave_pbar_rate:.4f}, Max Sum Rate: {ave_pbar_max_rate:.4f}, Learning Rate: {current_lr:.2e}, teacher_weight: {teacher_weight:.2f}, Gradient Norm: {ave_grad_norm:.4f}")
+        ave_rate_history.append(th.tensor(ave_pbar_rate))
+        test_rate_history.append(th.tensor(ave_pbar_max_rate))
+
+        if (epoch + 1) % 10 == 0:
+            checkpoint = {
+                'epoch': epoch + 1,
+                'model_state_dict': model.state_dict(),
+                'optimizer_state_dict': optimizer.state_dict(),
+                'scheduler_state_dict': scheduler.state_dict(),
+                'avg_rate': ave_pbar_rate,
+                'max_rate': ave_pbar_max_rate,
+                'config': config.__dict__ 
+            }
+
+            # checkpoint_path = os.path.join(save_dir, f"checkpoint_epoch_{epoch+1}.pt")
+            # th.save(checkpoint, checkpoint_path)
+            # # print(f"Checkpoint saved at epoch {epoch+1} to {checkpoint_path}")
+                
+            th.save(checkpoint, best_model_path)
+            print(f"Best model saved with rate {ave_pbar_rate:.4f}")
+
+            saved_history = {
+                'rate_history': rate_history,
+                'ave_rate_history': ave_rate_history,
+                'test_rate_history': test_rate_history,
+                'start_epoch': epoch + 1,
+                'learning_rate': current_lr,
+                'config': config.__dict__
+            }
+
+            # th.save(saved_history, os.path.join(save_dir, "saved_history.pt"))
+            th.save(saved_history, "saved_history.pt")
+            print(f"History saved at epoch {epoch + 1}")
+
+
+    rate_history = th.stack(rate_history)
+    ave_rate_history = th.stack(ave_rate_history)
+    test_rate_history = th.stack(test_rate_history)
+    th.save(rate_history, f"rate_train_history_{config.num_users}_{config.num_tx}_hybrid_attn_multi_layer.pth")
+    rate_history = th.load(f"rate_train_history_{config.num_users}_{config.num_tx}_hybrid_attn_multi_layer.pth")
+    th.save(ave_rate_history, f"rate_ave_history_{config.num_users}_{config.num_tx}_hybrid_attn_multi_layer.pth")
+    ave_rate_history = th.load(f"rate_ave_history_{config.num_users}_{config.num_tx}_hybrid_attn_multi_layer.pth")
+    th.save(test_rate_history, f"rate_test_history_{config.num_users}_{config.num_tx}_hybrid_attn_multi_layer.pth")
+    test_rate_history = th.load(f"rate_test_history_{config.num_users}_{config.num_tx}_hybrid_attn_multi_layer.pth")
+
+    # Create x-axis values for both plots
+    x_rate_history = th.arange(len(rate_history))
+    x_test_rate_history = th.arange(len(test_rate_history)) * config.pbar_size  # Scale by pbar_size
+
+    plt.figure(figsize=(10, 6))
+    plt.plot(x_rate_history, rate_history, marker='.', linestyle='-', color='b', label='Training Rate')
+    plt.plot(x_test_rate_history, ave_rate_history, marker='*', linestyle='-', color='g', label='Average Rate')
+    plt.plot(x_test_rate_history, test_rate_history, marker='o', linestyle='-', color='r', label='Testing Rate')
+    plt.title(f"Training and Testing Rate when N={config.num_tx} and K={config.num_users}")
+    plt.legend()
+    plt.xlabel("Epochs")
+    plt.ylabel("Sum Rate")
+    plt.grid(True, which="both", ls="--")
+    plt.show()
+
+#############################################
+# 8. Config class
+#############################################
+class BeamformerTransformerConfig:
+    def __init__(self, **kwargs):
+        self.d_model = kwargs['d_model']      # Transformer model dimension
+        self.beam_dim = kwargs['beam_dim']      # Beamformer vector dimension
+        self.n_head = kwargs['n_head']          # Number of attention heads
+        self.n_layers = kwargs['n_layers']      # Number of transformer layers
+        self.batch_size = kwargs['batch_size']
+        self.learning_rate = kwargs['learning_rate']
+        self.weight_decay = kwargs['weight_decay']
+        self.max_epoch = kwargs['max_epoch']
+        self.num_users = kwargs['num_users']
+        self.num_tx = kwargs['num_tx']
+        self.sigma2 = kwargs['sigma2']
+        self.T = kwargs['T']
+        self.SNR_power = kwargs['SNR_power']
+        self.attn_pdrop = kwargs['attn_pdrop']
+        self.resid_pdrop = kwargs['resid_pdrop']
+        self.mlp_ratio = kwargs['mlp_ratio']
+        self.subspace_dim = kwargs['subspace_dim']
+        self.pbar_size = kwargs['pbar_size']
+        self.mmse_epoch = kwargs['mmse_epoch']
+        self.pgd_step_size = kwargs['pgd_step_size']
+        self.pgd_steps = kwargs['pgd_steps']
+        self.embed_dim = kwargs['embed_dim']
+
+if __name__ == "__main__":
+
+    ## Example configuration where num_users = num_tx = 32, already the best setting.
+    num_users = 32
+    num_tx = 32  
+    beam_dim = 2*num_tx*num_users # Beamformer vector dimension
+    d_model = 768 # Transformer single-token dimension
+    n_head = 12 # Number of attention heads
+    n_layers = 1 # Number of transformer layers
+    T = 1 # Number of time steps
+    batch_size = 64
+    learning_rate = 1e-4
+    weight_decay = 0.02
+    max_epoch = 2000
+    sigma2 = 1.0  
+    SNR = 15
+    SNR_power = 10 ** (SNR/10) # SNR power in dB
+    attn_pdrop = 0.05
+    resid_pdrop = 0.05
+    mlp_ratio = 4
+    subspace_dim = 4
+    pbar_size = 500
+    mmse_epoch = 200  # Epoch incorporating mmse supervision
+    pgd_step_size = 1.75e-2  # Step size for PGD refinement
+    pgd_steps = 10  # Number of PGD steps
+    embed_dim = 256
+
+    # # Example configuration where num_users = num_tx = 20.
+    # num_users = 28
+    # num_tx = 28
+    # d_model = 640 # Transformer single-token dimension
+    # beam_dim = 2*num_tx*num_users # Beamformer vector dimension
+    # n_head = 10 # Number of attention heads
+    # n_layers = 5 # Number of transformer layers
+    # T = 1 # Number of time steps
+    # batch_size = 64
+    # learning_rate = 2e-4
+    # weight_decay = 0.0
+    # max_epoch = 2000
+    # sigma2 = 1.0  
+    # SNR = 15
+    # SNR_power = 10 ** (SNR/10) # SNR power in dB
+    # attn_pdrop = 0.0
+    # resid_pdrop = 0.0
+    # mlp_ratio = 4
+    # subspace_dim = 4
+    # pbar_size = 500
+    # mmse_epoch = 200  # Epoch incorporating mmse supervision
+    
+#    # Example configuration where num_users = num_tx = 20.
+#     num_users = 20
+#     num_tx = 20
+#     d_model = 640 # Transformer single-token dimension
+#     beam_dim = 2*num_tx*num_users # Beamformer vector dimension
+#     n_head = 10 # Number of attention heads
+#     n_layers = 5 # Number of transformer layers
+#     T = 1 # Number of time steps
+#     batch_size = 64
+#     learning_rate = 2e-4
+#     weight_decay = 0.0
+#     max_epoch = 2000
+#     sigma2 = 1.0  
+#     SNR = 15
+#     SNR_power = 10 ** (SNR/10) # SNR power in dB
+#     attn_pdrop = 0.0
+#     resid_pdrop = 0.0
+#     mlp_ratio = 4
+#     subspace_dim = 4
+#     pbar_size = 500
+#     mmse_epoch = 200  # Epoch incorporating mmse supervision
+
+    # Create configuration object.
+    config = BeamformerTransformerConfig(
+        d_model=d_model,
+        beam_dim=beam_dim,
+        n_head=n_head,
+        n_layers=n_layers,
+        batch_size=batch_size,
+        learning_rate=learning_rate,
+        weight_decay=weight_decay,
+        max_epoch=max_epoch,
+        num_users=num_users,
+        num_tx=num_tx,
+        sigma2=sigma2,
+        T=T,
+        SNR_power=SNR_power,
+        attn_pdrop=attn_pdrop,
+        resid_pdrop=resid_pdrop,
+        mlp_ratio=mlp_ratio,
+        subspace_dim=subspace_dim,
+        pbar_size=pbar_size,
+        mmse_epoch=mmse_epoch,
+        pgd_step_size=pgd_step_size,
+        pgd_steps=pgd_steps,
+        embed_dim=embed_dim
+    )
+
+    model_path_stage_1 = f"{config.num_users}_{config.num_tx}_6_5_store/best_model_6_5_5b.pt"
+    history_path_stage_1 = f"{config.num_users}_{config.num_tx}_6_5_store/saved_history_6_5_5b.pt"
+    
+    ### Train the beamforming transformer.
+    train_beamforming_transformer(config) ## first time training
+    # train_beamforming_transformer(config, pretrained_path=model_path_stage_1, history_path=history_path_stage_1) ## training with pretrained model/historical data
