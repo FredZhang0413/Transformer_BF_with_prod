@@ -89,7 +89,7 @@ def compute_mmse_beamformer(mat_H, K, N, P, noise_power=1, device=th.device("cud
 # Single L2O Block: multi-head self‐attention
 #############################################
 class MultiHeadAttention(nn.Module): ### self-attention version
-    def __init__(self, token_dim, seq_len, d_model, num_heads, dropout):
+    def __init__(self, token_dim, seq_len, d_model, num_heads, embed_dim, dropout):
         """
         d_model: dimension of each token (D)
         num_heads: number of attention heads (h)
@@ -104,13 +104,13 @@ class MultiHeadAttention(nn.Module): ### self-attention version
         self.num_heads = num_heads # number of attention heads
         self.head_dim = d_model // num_heads # dimension of each head (d)
 
-        # self.x_embedding = nn.Linear(token_dim, d_model)  # linear projection to d_model
-        self.x_ln = nn.LayerNorm(token_dim)  # LayerNorm for input tokens
+        self.x_embedding = nn.Linear(token_dim, embed_dim)  # linear projection to d_model
+        self.x_ln = nn.LayerNorm(embed_dim)  # LayerNorm for input tokens
 
         # linear projections for Q, K, V
-        self.q_proj = nn.Linear(token_dim, d_model)
-        self.k_proj = nn.Linear(token_dim, d_model)
-        self.v_proj = nn.Linear(token_dim, d_model)
+        self.q_proj = nn.Linear(embed_dim, d_model)
+        self.k_proj = nn.Linear(embed_dim, d_model)
+        self.v_proj = nn.Linear(embed_dim, d_model)
 
         self.head_collect = nn.Linear(d_model, token_dim)  # linear projection to collect heads
 
@@ -125,8 +125,8 @@ class MultiHeadAttention(nn.Module): ### self-attention version
         """
         B, L, D = x.shape ## L = 4K, D = token_dim
         h, d = self.num_heads, self.head_dim  ## d_model = h * d
-
-        x_ln = self.x_ln(x)    
+        x_embed = self.x_embedding(x)  # (B, L, D) -> (B, L, embed_dim)
+        x_ln = self.x_ln(x_embed)
 
         # 1) project to Q,K,V and reshape for multi-head:
         #    -> (B, L, h, d) -> (B, h, L, d)
@@ -159,7 +159,7 @@ class MultiHeadAttention(nn.Module): ### self-attention version
 ### input X_user, X_ant: shape (B, 4*K, N)
 ### ouptut y_h_next, y_w_next: shape (B, 2K, token_dim) and (B, 2N, token_dim)
 class TransformerBlock(nn.Module):
-    def __init__(self, token_dim, seq_len, n_head, resid_pdrop, config):
+    def __init__(self, token_dim, seq_len, n_head, resid_pdrop, embed_dim, config):
         super(TransformerBlock, self).__init__()
         d_model = config.d_model
         n_head = config.n_head
@@ -172,11 +172,11 @@ class TransformerBlock(nn.Module):
 
         # single-layer at first
         self.self_attn_user = MultiHeadAttention(
-            token_dim=token_dim, seq_len=seq_len, d_model=d_model, num_heads=n_head, dropout=resid_pdrop
+            token_dim=token_dim, seq_len=seq_len, d_model=d_model, num_heads=n_head, embed_dim=embed_dim, dropout=resid_pdrop
         )
 
         self.self_attn_ant = MultiHeadAttention(
-            token_dim=token_dim, seq_len=seq_len, d_model=d_model, num_heads=n_head, dropout=resid_pdrop
+            token_dim=token_dim, seq_len=seq_len, d_model=d_model, num_heads=n_head, embed_dim=embed_dim, dropout=resid_pdrop
         )
 
         #### layernorm before MLP and FC layers
@@ -271,7 +271,7 @@ class L2OTransformer(nn.Module):
 
         # build n_layers identical blocks
         self.mhsa_blocks = nn.ModuleList([
-            TransformerBlock(token_dim=token_dim, seq_len=seq_len, n_head=config.n_head, resid_pdrop=config.resid_pdrop, config=config)
+            TransformerBlock(token_dim=token_dim, seq_len=seq_len, n_head=config.n_head, resid_pdrop=config.resid_pdrop, embed_dim=config.embed_dim, config=config)
         for _ in range(config.n_layers)])
 
         # Weight initialization.
@@ -676,6 +676,7 @@ class BeamformerTransformerConfig:
         self.mmse_epoch = kwargs['mmse_epoch']
         self.pgd_step_size = kwargs['pgd_step_size']
         self.pgd_steps = kwargs['pgd_steps']
+        self.embed_dim = kwargs['embed_dim']
 
 if __name__ == "__main__":
 
@@ -702,6 +703,7 @@ if __name__ == "__main__":
     mmse_epoch = 200  # Epoch incorporating mmse supervision
     pgd_step_size = 1.5e-2  # Step size for PGD refinement
     pgd_steps = 10  # Number of PGD steps
+    embed_dim = 256
 
     # # Example configuration where num_users = num_tx = 20.
     # num_users = 28
@@ -769,7 +771,8 @@ if __name__ == "__main__":
         pbar_size=pbar_size,
         mmse_epoch=mmse_epoch,
         pgd_step_size=pgd_step_size,
-        pgd_steps=pgd_steps
+        pgd_steps=pgd_steps,
+        embed_dim=embed_dim
     )
 
     model_path_stage_1 = f"{config.num_users}_{config.num_tx}_6_5_store/best_model_6_5_5b.pt"
