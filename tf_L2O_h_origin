@@ -633,7 +633,8 @@ def train_beamforming_transformer(config, pretrained_path: str = None, history_p
             rate_history.append(th.tensor(ave_rate))
             pbar_batches += 1
             # pbar.set_description(f"Epoch {epoch+1}, Avg Rate: {ave_rate:.4f}, Max Rate: {final_rate:.4f}")
-            pbar.set_description(f"Epoch {epoch+1}, Rate per batch: {rate_record_per_batch}")
+            formatted_rates = [f"{rate:.4f}" for rate in rate_record_per_batch]
+            pbar.set_description(f"Epoch {epoch+1}, Rate per batch: {formatted_rates}")
         
         scheduler.step()
         current_lr = optimizer.param_groups[0]['lr']
@@ -660,7 +661,7 @@ def train_beamforming_transformer(config, pretrained_path: str = None, history_p
             # # print(f"Checkpoint saved at epoch {epoch+1} to {checkpoint_path}")
                 
             th.save(checkpoint, best_model_path)
-            print(f"Best model saved with rate {ave_pbar_rate:.4f}")
+            print(f"Best model saved with final rate {ave_pbar_max_rate:.4f}")
 
             saved_history = {
                 'rate_history': rate_history,
@@ -738,7 +739,7 @@ if __name__ == "__main__":
     beam_dim = 2*num_tx*num_users # Beamformer vector dimension
     d_model = 768 # Transformer single-token dimension
     n_head = 12 # Number of attention heads
-    n_layers = 3 # Number of transformer layers
+    n_layers = 7 # Number of transformer layers
     T = 1 # Number of time steps
     batch_size = 64
     learning_rate = 1e-4
@@ -753,8 +754,8 @@ if __name__ == "__main__":
     subspace_dim = 4
     pbar_size = 500
     mmse_epoch = 200  # Epoch incorporating mmse supervision
-    pgd_step_size = 2e-2  # Step size for PGD refinement
-    pgd_steps = 5  # Number of PGD steps
+    pgd_step_size = 1.75e-2  # Step size for PGD refinement
+    pgd_steps = 7  # Number of PGD steps
     embed_dim = 768
     r_decay = 0.5
 
@@ -829,8 +830,8 @@ if __name__ == "__main__":
         r_decay=r_decay
     )
 
-    model_path_stage_1 = f"{config.num_users}_{config.num_tx}_6_5_store/best_model_6_5_5b.pt"
-    history_path_stage_1 = f"{config.num_users}_{config.num_tx}_6_5_store/saved_history_6_5_5b.pt"
+    model_path_stage_1 = "best_model.pt"
+    history_path_stage_1 = "saved_history.pt"
     
     ### Train the beamforming transformer.
     train_beamforming_transformer(config) ## first time training
