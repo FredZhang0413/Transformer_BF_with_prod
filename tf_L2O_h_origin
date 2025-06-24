@@ -273,6 +273,8 @@ class L2OTransformer(nn.Module):
         # embedding dimension == num_tx
         self.num_tokens_h = 3 * self.K  # number of tokens in the H-stream (here 2*K)
         self.num_tokens_w = 3 * self.N  # number of tokens in the W-stream (here 2*N)
+        self.pgd_steps = config.pgd_steps  # number of PGD steps for beamformer update
+        self.pgd_step_size = config.pgd_step_size  # step size for PGD update
 
         # build n_layers identical blocks
         self.mhsa_blocks = nn.ModuleList([
@@ -319,7 +321,7 @@ class L2OTransformer(nn.Module):
         #             else:
         #                 nn.init.constant_(param, 0.01)
 
-    def forward(self, H, W_prev):
+    def forward(self, H_origin, W_prev):
         """
         Args:
           H:      complex channel matrix (B,K,N)
@@ -328,15 +330,15 @@ class L2OTransformer(nn.Module):
           H_traj: list of real/imag-concatenated channel features per step
           W_traj: list of real/imag-concatenated solutions per step
         """
-        B = H.size(0)
+        B = H_origin.size(0)
         K = self.K  # Number of users
         N = self.N  # Number of transmit antennas
 
-        H_user = th.cat([H.real, H.imag], dim=1)  # (B, 2*K, N)
+        H_user = th.cat([H_origin.real, H_origin.imag], dim=1)  # (B, 2*K, N)
         W_user = th.cat([W_prev.real, W_prev.imag], dim=1)  # (B, 2*K, N)
         X_user = th.cat([H_user, H_user, W_user], dim=1)  # (B, 6*K, N)
 
-        H_ant = th.cat([H.real.transpose(1, 2), H.imag.transpose(1, 2)], dim=1)  # (B, 2*N, K)
+        H_ant = th.cat([H_origin.real.transpose(1, 2), H_origin.imag.transpose(1, 2)], dim=1)  # (B, 2*N, K)
         W_ant = th.cat([W_prev.real.transpose(1, 2), W_prev.imag.transpose(1, 2)], dim=1)  # (B, 2*N, K)
         X_ant = th.cat([H_ant, H_ant, W_ant], dim=1)  # (B, 6*N, K)
 
@@ -345,6 +347,13 @@ class L2OTransformer(nn.Module):
             y_h_next, y_w_next = block(X_user, X_ant)  # (B, 2K, N) and (B, 2K, N)
             H_sol = y_h_next[:, :K, :] + 1j * y_h_next[:, K:, :]  # (B, K, N) -> complex channel features
             W_sol = y_w_next[:, :K, :] + 1j * y_w_next[:, K:, :]  # (B, K, N) -> complex beamformer
+            W_sol_trav = W_sol.transpose(-1, -2)  # (B, N, K) -> transpose for the next step
+            W_pre_update = W_sol_trav.clone().requires_grad_(True) 
+            for _ in range(self.pgd_steps):
+                loss_inner = sum_rate(H_origin, W_pre_update, sigma2=1.0)  # (B, num_tx, num_users)
+                grad_w = th.autograd.grad(loss_inner, W_pre_update, create_graph=True)[0]  ## maintain second-order gradient
+                W_pre_update = (W_pre_update + self.pgd_step_size * grad_w)  # (B, num_tx, num_users)
+            W_sol = W_pre_update.transpose(-1,-2) ## (B, K, N) -> transpose back to the original shape
             H_traj.append(H_sol)  
             W_traj.append(W_sol)
             H_user_update = th.cat([H_sol.real, H_sol.imag], dim=1)  # (B, 2*K, N)
@@ -509,8 +518,8 @@ def train_beamforming_transformer(config, pretrained_path: str = None, history_p
         dataloader = DataLoader(dataset, batch_size=config.batch_size, shuffle=True)
 
         # # Soft switch learning policy.
-        teacher_weight = max(0.0, 1.0 - (epoch / config.mmse_epoch))  # Linearly decrease from 1 to 0
-        # teacher_weight = 0.0  
+        # teacher_weight = max(0.0, 1.0 - (epoch / config.mmse_epoch))  # Linearly decrease from 1 to 0
+        teacher_weight = 0.0  
 
         epoch_loss = 0
         epoch_rate = 0
@@ -553,7 +562,7 @@ def train_beamforming_transformer(config, pretrained_path: str = None, history_p
                 # The model predicts the next beamformer.
                 _, W_traj, W_pred = model(H_mat, W_prev)  # (B, beam_dim)
                 len_traj = len(W_traj)  # Number of steps in the trajectory
-                for i in range(len(W_traj)):
+                for i in range(len_traj):
                     W_mat = W_traj[i].transpose(-1, -2).to(device)  # (B, num_tx, num_users)
                     rate = sum_rate(H_mat, W_mat, sigma2=config.sigma2)
                     total_rate += (config.r_decay ** (len_traj - i - 1)) * rate
@@ -588,9 +597,11 @@ def train_beamforming_transformer(config, pretrained_path: str = None, history_p
 
             else:
                 _, W_traj, W_pred = model(H_mat, W_prev)  # (B, beam_dim)
-                for i in range(len(W_traj)):
+                len_traj = len(W_traj)  # Number of steps in the trajectory
+                for i in range(len_traj):
                     W_mat = W_traj[i].transpose(-1, -2).to(device)  # (B, num_tx, num_users)
                     rate = sum_rate(H_mat, W_mat, sigma2=config.sigma2)
+                    rate_record_per_batch.append(rate.item())
                     total_rate += (config.r_decay ** (len_traj - i - 1)) * rate                                            
                 loss = - total_rate
                 final_rate = sum_rate(H_mat, W_pred.transpose(-1,-2), sigma2=config.sigma2)
@@ -742,9 +753,9 @@ if __name__ == "__main__":
     subspace_dim = 4
     pbar_size = 500
     mmse_epoch = 200  # Epoch incorporating mmse supervision
-    pgd_step_size = 1.5e-2  # Step size for PGD refinement
-    pgd_steps = 10  # Number of PGD steps
-    embed_dim = 256
+    pgd_step_size = 2e-2  # Step size for PGD refinement
+    pgd_steps = 5  # Number of PGD steps
+    embed_dim = 768
     r_decay = 0.5
 
     # # Example configuration where num_users = num_tx = 20.
