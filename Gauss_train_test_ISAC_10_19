@@ -1,0 +1,850 @@
+# Alternating L2O Transformer for Joint Sensing & Communication Beamforming (ISAC)
+# -------------------------------------------------------------------------------
+
+# - Communication beamformer:   W ∈ C^{N * K},  ||W||_F = 1
+# - Sensing beamformer:         F ∈ C^{N * N},  ||F||_F = 1
+# - Channels:
+#     * Comm H ∈ C^{K * N}  (row k is user-k channel)
+#     * Sensing single-target H_m = β_m a_r(θ_m) a_t(θ_m)^H ∈ C^{N * N}
+#     * Active set M ⊆ {1,...,M_total}. Effective G = sum_{m∈M} H_m, normalized to ||G||_F = N
+# - Losses:
+#     * L_comm = - SumRate(H, W, F) , where SINR_k denominator adds sensing leakage ||h_k F||^2
+#     * L_sense = - sum_{m∈M} min(0, SNR_m - η), with SNR_m = (||H_m W||_F^2 + ||H_m F||_F^2) / \sigma_z^2
+
+
+import math
+import os
+import time
+import warnings
+from bisect import bisect_right
+
+import numpy as np
+import torch as th
+import torch.nn as nn
+import torch.nn.functional as F
+import torch.optim as optim
+from torch.utils.data import DataLoader, Dataset
+from tqdm import tqdm
+from pdb import set_trace as bp
+
+warnings.filterwarnings("ignore")
+
+mse_loss_fn = nn.MSELoss()
+device = th.device("cuda:0" if th.cuda.is_available() else "cpu")
+
+th.backends.cudnn.benchmark = True
+if device.type == "cuda":
+    th.set_float32_matmul_precision("high") 
+
+# -----------------------------
+# Utilities: complex helpers
+# -----------------------------
+def cabs2(x: th.Tensor) -> th.Tensor:
+    """Return |x|^2 for complex tensors."""
+    return (x.real ** 2 + x.imag ** 2)
+
+
+def frob_norm2(x: th.Tensor, dims=(-2, -1)) -> th.Tensor:
+    """Frobenius norm squared over matrix dims, shape (B,) if batch matrices."""
+    return th.sum(cabs2(x), dim=dims)
+
+
+def proj_fro_unit(x: th.Tensor) -> th.Tensor:
+    """
+    Project complex matrix batch to Frobenius norm = 1 (per sample).
+    x: (B, ..., ...)
+    """
+    eps = 1e-12
+    # keep batch dimension
+    norm = th.sqrt(th.sum(cabs2(x), dim=tuple(range(1, x.ndim)), keepdim=True) + eps)
+    return x / norm
+
+
+def proj_fro_value(x: th.Tensor, target_norm: float) -> th.Tensor:
+    """Project to Frobenius norm = target_norm (per sample)."""
+    return proj_fro_unit(x) * target_norm
+
+
+# -----------------------------
+# Array & target modeling
+# -----------------------------
+def ula_steering_vec(N: int, theta: th.Tensor) -> th.Tensor:
+    """
+    Half-wavelength ULA steering vector of size N at angle(s) theta (rad).
+    Return shape: (B, N) if theta is (B,), normalized by 1/sqrt(N).
+    """
+    # spatial frequency: pi*sin(theta) with d=λ/2 -> k=π*sin θ
+    k = math.pi * th.sin(theta)
+    n = th.arange(N, device=theta.device).float().view(1, -1)  # (1,N)
+    # exp(j * n * k) per batch
+    ph = th.exp(1j * (n * k.view(-1, 1)))  # (B,N)
+    return ph / math.sqrt(N)
+
+
+def build_sensing_matrices(N: int, M_total: int, active_mask: th.Tensor):
+    """
+    Random targets: β_m ~ CN(0,1), θ_m ~ U[0,π/2], then H_m = β a_r(θ) a_t(θ)^H.
+    active_mask: (B, M_total) with {0,1}, indicating which targets are active.
+    Return:
+        Hm_list: list of length M_total, each tensor (B, N, N) complex
+        G: (B,N,N) complex, normalized to ||G||_F = N over batch-wise
+    """
+    # if device is None:
+    #     device = active_mask.device
+    B = active_mask.shape[0] ## a batch of samples
+    thetas = (th.rand(B, M_total, device=device) * (math.pi / 2.0))  # (B,M), U[0,π/2]
+    beta = (th.randn(B, M_total, device=device) + 1j * th.randn(B, M_total, device=device)) / math.sqrt(2.0) # (B,M), CN(0,1)
+
+    Hm_list = [] # list of (B,N,N) complex
+    G = th.zeros(B, N, N, dtype=th.complex64, device=device)
+    for m in range(M_total):
+        ar = ula_steering_vec(N, thetas[:, m])  # (B,N)
+        at = ula_steering_vec(N, thetas[:, m])  # assume same array both sides
+        Hm = beta[:, m].view(B, 1, 1) * ar.view(B, N, 1) * th.conj(at.view(B, 1, N)) # (B,N,N) complex
+        Hm_list.append(Hm)
+        G = G + (active_mask[:, m].view(B, 1, 1) * Hm) ## accumulate active targets
+
+    # Normalize G to ||G||_F = sqrt{N * N}
+    target_norm = float(N)
+    G = proj_fro_value(G, target_norm)
+    return Hm_list, G
+
+
+# -----------------------------
+# Datasets
+# -----------------------------
+class ISACDataset(Dataset):
+    """
+    Generate batch samples of (H, {H_m}, G, active_mask) for K=N case by default.
+    - H is i.i.d. CN(0,1) then scaled so that ||H||_F = sqrt(K*N*SNR_lin)
+    - Active target subset: non-empty random subset of M_total
+    """
+    def __init__(self, num_samples: int, K: int, N: int, M_total: int, SNR_lin: float):
+        super().__init__()
+        self.num_samples = num_samples
+        self.K = K
+        self.N = N
+        self.M_total = M_total
+        self.SNR_lin = SNR_lin # SNR for communication channel
+
+    def __len__(self):
+        return self.num_samples
+
+    def __getitem__(self, idx): ## each sample
+        K, N, M = self.K, self.N, self.M_total
+
+        # Comm channel: H_raw ~ CN(0,1), then scale to ||H||_F = sqrt(K*N*SNR)
+        H_raw = (th.randn(K, N) + 1j * th.randn(K, N)) / math.sqrt(2.0) # (K,N) complex
+        desired = math.sqrt(K * N * self.SNR_lin)
+        H = proj_fro_value(H_raw.unsqueeze(0), desired).squeeze(0)  # (K,N) complex, ||H||_F = sqrt(K*N*SNR)
+
+        # Active subset mask (non-empty)
+        # Sample integer 1..M
+        active_cnt = np.random.randint(1, M + 1) ## number of active targets
+        idxs = np.random.choice(M, size=active_cnt, replace=False) # active target indices
+        active_mask = th.zeros(M, device=device) # (M,)
+        active_mask[idxs] = 1.0 # mark active targets
+
+        # Build H_m list and G
+        Hm_list, G = build_sensing_matrices(N, M, active_mask.unsqueeze(0)) ## (1,N,N) complex
+        # each Hm in list has shape (1,N,N); stack -> (M,N,N)
+        Hm = th.stack([h.squeeze(0) for h in Hm_list], dim=0)
+
+        sample = {
+            "H_real": H.real.float(), "H_imag": H.imag.float(),    # for dataloader CPU pinning friendliness
+            "Hm_real": Hm.real.float(), "Hm_imag": Hm.imag.float(),
+            "G_real": G.squeeze(0).real.float(),
+            "G_imag": G.squeeze(0).imag.float(),
+            "active_mask": active_mask.float(),
+        }
+        return sample
+
+
+def to_complex(mat_real: th.Tensor, mat_imag: th.Tensor) -> th.Tensor: ## convert to complex
+    return mat_real.to(device) + 1j * mat_imag.to(device)
+
+
+# -----------------------------
+# Baseline initializers
+# -----------------------------
+def compute_mmse_beamformer(H: th.Tensor, K: int, N: int, total_power: float = 1.0, noise_power: float = 1.0):
+    """
+    MMSE/WSLNR-like precoder: W ∈ C^{N*K}, columns per user then scaled to Fro norm = 1.
+    H: (B,K,N) complex
+    """
+    B = H.shape[0]
+    H = H.to(th.complex128)
+    P = total_power  # here we ultimately project to ||W||_F=1, so 'P' won't matter much
+    eye_N = th.eye(N, device=H.device, dtype=th.complex128).unsqueeze(0).repeat(B, 1, 1)
+    # (B,N,N) = (B,N,K)(B,K,K)(B,K,N)
+    mat = th.conj(H).transpose(1, 2) @ H  # (B,N,N)
+    denom = eye_N * noise_power + mat * (P / K)
+    denom_inv = th.linalg.pinv(denom)
+    W = denom_inv @ th.conj(H).transpose(1, 2)  # (B,N,K)
+    # normalize to Frobenius norm = 1
+    W = W.to(th.complex64)
+    W = proj_fro_unit(W)
+    return W
+
+
+def init_F_in_nullspace(H: th.Tensor, N: int) -> th.Tensor:
+    """
+    Approximate F in near null-space of H via projector:
+        P_eps = I - H^H (H H^H + eps I)^{-1} H
+    Then set F = P_eps @ I (optionally repeat), finally normalize to ||F||_F = 1.
+    Assumes H is (almost) full-rank (K==N).
+    """
+    assert H.dim() == 3
+    B, K, N_ = H.shape
+    assert N_ == N, "H shape mismatch"
+    # projector params
+    eps_reg = 1e-2
+    iters = 2
+
+    # build projector in higher precision for stability
+    H128 = H.detach().to(th.complex128)  # do not keep graph
+    I_N = th.eye(N, device=H.device, dtype=th.complex128).expand(B, N, N)
+    I_K = th.eye(K, device=H.device, dtype=th.complex128).expand(B, K, K)
+
+    A = H128 @ H128.conj().transpose(1, 2)           # (B,K,K)
+    A_reg = A + eps_reg * I_K
+    A_inv = th.linalg.pinv(A_reg)                    # (B,K,K)
+    P = I_N - (H128.conj().transpose(1, 2) @ (A_inv @ H128))  # (B,N,N)
+    P = P.to(th.complex64)
+
+    # start from identity and project into near-null space
+    F = th.eye(N, device=H.device, dtype=th.complex64).expand(B, N, N).clone()
+    for _ in range(max(1, iters)):
+        F = P @ F
+        F = proj_fro_unit(F)  # keep numeric scale stable
+
+    # final normalization to ||F||_F = 1
+    F = proj_fro_unit(F) ## (B,N,N)
+    return F
+
+# def init_F_in_nullspace(H: th.Tensor, N: int) -> th.Tensor:
+#     """
+#     Approximate a sensing beamformer F that lies in the (near) null-space of H (so that H*F ≈ 0).
+#     Strategy: compute right singular vectors of H (shape B*K*N). Take last N-K vectors as columns,
+#               then map to a square N*N (pad/rotate) and normalize to ||F||_F=1.
+#     """
+#     B, K, N_ = H.shape
+#     assert N_ == N
+#     F_list = []
+#     Hc = H.detach()
+
+#     for b in range(B):
+#         # SVD of H* (K×N), null-space lives in right singular vectors with small singular values
+#         U, S, Vh = th.linalg.svd(Hc[b].to(th.complex64), full_matrices=True)  # Vh: (N,N)
+#         # Take the subspace of smallest singular values
+#         if K < N:
+#             V_null = Vh.conj().transpose(0, 1)[:, K:]  # (N, N-K)
+#             # Fill to N×N by adding orthonormal complement (cyclic) then form a unitary-ish matrix
+#             if V_null.shape[1] < N:
+#                 V_keep = Vh.conj().transpose(0, 1)[:, :K]  # (N,K)
+#                 F_b = th.cat([V_null, V_keep[:, : (N - V_null.shape[1])]], dim=1)  # (N,N)
+#             else:
+#                 F_b = V_null[:, :N]
+#         else:
+#             # If K==N, use the weakest directions
+#             order = th.argsort(S)  # ascending, indices of singular values
+#             V = Vh.conj().transpose(0, 1)  # (N,N)
+#             F_b = V[:, order]  # reorder columns (weak first)
+#         # Normalize to Fro=1
+#         F_list.append(proj_fro_unit(F_b.unsqueeze(0)).squeeze(0)) ## (N,N)
+
+#     F = th.stack(F_list, dim=0)  # (B,N,N), each ||F_b||_F = 1
+#     return F
+
+
+# -----------------------------
+# Physics-driven losses
+# -----------------------------
+def sum_rate_with_sensing_interf(H: th.Tensor, W: th.Tensor, Fm: th.Tensor, noise_pow: float = 1.0) -> th.Tensor:
+    """
+    Sum-rate where interference includes sensing leakage ||h_k F||^2
+    Inputs:
+        H: (B,K,N) complex
+        W: (B,N,K) complex
+        Fm: (B,N,N) complex (sensing beamformer)
+    Return: mean over batch scalar
+    """
+    B, K, N = H.shape
+    # HW: (B,K,K)
+    HW = H @ W
+    S = cabs2(th.diagonal(HW, dim1=-2, dim2=-1))  # (B,K)
+    I_comm = th.sum(cabs2(HW), dim=-1) - S        # (B,K)
+    # sensing leakage per user: ||h_k F||^2 = ||row_k(H) * F||_2^2
+    HF = (H @ Fm)  # (B,K,N)
+    I_sense = th.sum(cabs2(HF), dim=-1)  # (B,K)
+    SINR = S / (I_comm + I_sense + noise_pow)
+    rate = th.log2(1.0 + SINR).sum(dim=-1)  # (B,)
+    return rate.mean() # mean over batch
+
+### this computation is only necessary when target is activated
+### \sigma_z is the noise power at the radar receiver
+def sensing_snr_per_target(Hm: th.Tensor, W: th.Tensor, Fm: th.Tensor, sigma_z2: float = 0.1) -> th.Tensor:
+    """
+    SNR_m = (||H_m W||_F^2 + ||H_m F||_F^2) / \sigma_z^2, computed per-target.
+    Inputs:
+        Hm: (B,M,N,N) complex  (#targets per sample)
+        W:  (B,N,K) complex
+        Fm: (B,N,N) complex
+    Return:
+        snr_m: (B,M) real (linear scale)
+    """
+    B, M, N, _ = Hm.shape
+    HW = th.matmul(Hm, W.unsqueeze(1))          # (B,M,N,K)
+    HF = th.matmul(Hm, Fm.unsqueeze(1))         # (B,M,N,N)
+    num = th.sum(cabs2(HW), dim=(-2, -1)) + th.sum(cabs2(HF), dim=(-2, -1))  # (B,M)
+    snr_sensing = th.log10(num / sigma_z2) * 10.0
+    return snr_sensing
+
+
+def sensing_barrier_loss(Hm: th.Tensor, W: th.Tensor, Fm: th.Tensor, active_mask: th.Tensor,
+                         eta_dB: float = 5.0, sigma_z2: float = 0.1) -> th.Tensor:
+    """
+    L_sense = - sum_{m in M} min(0, SNR_m - eta)
+    Only active targets (mask==1) contribute; satisfied ones (>=eta) don't backprop.
+    """
+    eta_lin = 10.0 ** (eta_dB / 10.0)
+    snr_m = sensing_snr_per_target(Hm, W, Fm, sigma_z2)  # (B,M)
+    # violation = clamp(eta - snr_m, min=0)  -> but we want -min(0, snr-eta) == max(0, eta-snr)
+    viol = F.relu(eta_lin - snr_m)  # (B,M), only not satisfied eta targets contribute
+    loss = (viol * active_mask).sum(dim=-1).mean() ## only active targets contribute
+    return loss
+
+
+# -----------------------------
+# Transformer building blocks
+# -----------------------------
+class DualStreamMHA(nn.Module):
+    """
+    Safer attention that supports different token dims on the two streams.
+    Stream-A: user-level tokens (length LA, emb dim DA)
+    Stream-B: antenna-level tokens (length LB, emb dim DB)
+    Both are projected to common d_model and multi-head attention is performed on concat.
+    """
+    def __init__(self, in_dim_A, in_dim_B, seq_len_A, seq_len_B, d_model, embed_dim, num_heads, dropout):
+        super().__init__()
+        assert d_model % num_heads == 0
+        self.h = num_heads
+        self.d = d_model // num_heads ## dim per head
+        self.LA = seq_len_A
+        self.LB = seq_len_B
+        self.divide_len = seq_len_A // 2
+
+        self.embA = nn.Linear(in_dim_A, embed_dim) ## input embedding for A stream
+        self.embB = nn.Linear(in_dim_B, embed_dim)
+        self.lnA = nn.LayerNorm(embed_dim)
+        self.lnB = nn.LayerNorm(embed_dim)
+
+        self.qA = nn.Linear(embed_dim, d_model)
+        self.kA = nn.Linear(embed_dim, d_model)
+        self.vA = nn.Linear(embed_dim, d_model)
+        self.qB = nn.Linear(embed_dim, d_model)
+        self.kB = nn.Linear(embed_dim, d_model)
+        self.vB = nn.Linear(embed_dim, d_model)
+
+        self.head_collect_mlp = nn.Sequential(
+            nn.Linear(2 * d_model, 4 * in_dim_A),
+            nn.GELU(),
+            nn.Linear(4 * in_dim_A, 2 * in_dim_A),
+            nn.GELU(),
+            nn.Linear(2 * in_dim_A, in_dim_A),
+        )
+        self.attn_drop = nn.Dropout(dropout)
+
+    def forward(self, XA, XB):
+        """
+        XA: (B, LA, in_dim_A), XB: (B, LB, in_dim_B)
+        Return: YA: (B, LA, in_dim_A)  (we focus on A stream for simplicity)
+        """
+        B, LA, DAin = XA.shape
+        LB, DBin = XB.shape[1], XB.shape[2]
+        assert LA == self.LA and LB == self.LB
+
+        A_embed = self.lnA(self.embA(XA))  # (B,LA,embed_dim)
+        B_embed = self.lnB(self.embB(XB))  # (B,LB,embed_dim)
+
+        # Heads
+        def split(x):  # (B,L,embed_dim)->(B,h,L,d)
+            return x.view(B, -1, self.h, self.d).transpose(1, 2)
+
+        QA, KA, VA = split(self.qA(A_embed)), split(self.kA(A_embed)), split(self.vA(A_embed))
+        QB, KB, VB = split(self.qB(B_embed)), split(self.kB(B_embed)), split(self.vB(B_embed))
+
+        # concat in head dimension
+        Q = th.cat([QA, QB], dim=1)  # (B,2h,L*,d)
+        K = th.cat([KA, KB], dim=1)
+        V = th.cat([VA, VB], dim=1)
+
+        attn = (Q @ K.transpose(-2, -1)) / math.sqrt(self.d)  # (B,2h,L*,L*)
+        attn = F.softmax(attn, dim=-1)
+        attn = self.attn_drop(attn)
+        ctx = attn @ V  # (B,2h,L*,d)
+
+        ctx = ctx.transpose(1, 2).contiguous().view(B, -1, 2 * self.d * self.h)  # (B,L*,2*d_model)
+        context = self.head_collect_mlp(ctx)  # (B,L*,inA or inB)
+
+        y_A = context + XA  # residual
+        y_B = context + XB  # residual
+
+        y_h_mlp = y_A[:, :self.divide_len, :] + y_B[:, :self.divide_len, :] ## feature for channel 
+        y_w_mlp = y_A[:, self.divide_len:, :] + y_B[:, self.divide_len:, :] ## feature for beamformer
+
+        return y_h_mlp, y_w_mlp
+
+
+class CommBlock(nn.Module):
+    """
+    Communication L2O block: updates W given (H, W_prev) and (fixed) F,G as side info.
+    We encode:
+      - A-stream (user view): [Re(H), Im(H), Re(W^T), Im(W^T)] along last dim
+      - B-stream (antenna view): [Re(H^T), Im(H^T), Re(W), Im(W)]
+    """
+    def __init__(self, K, N, d_model=512, embed_dim=128, num_heads=8, dropout=0.0):
+        super().__init__()
+        self.K, self.N = K, N
+        inA = N  # per-token dim when stacking real/imag of row(H) or row(W^H)
+        inB = K
+        LA = 4 * K   # [H_row, W_row] -> 4K tokens
+        LB = 4 * N   # [H_col, W_col] -> 4N tokens
+        self.mha_comm = DualStreamMHA(inA, inB, LA, LB, d_model, embed_dim, num_heads, dropout)
+        self.ln_h = nn.LayerNorm(inA) ## inA = token dim for A stream
+        self.ln_w = nn.LayerNorm(inB) ## inB = token dim for B stream
+        self.mlp_h = nn.Sequential(
+            nn.Linear(inA, 4 * inA),
+            nn.GELU(),
+            nn.Linear(4 * inA, 4 * inA),
+            nn.GELU(),
+            nn.Linear(4 * inA, inA),
+            nn.LayerNorm(inA),
+        )
+        self.mlp_w = nn.Sequential(
+            nn.Linear(inB, 4 * inB),
+            nn.GELU(),
+            nn.Linear(4 * inB, 4 * inB),
+            nn.GELU(),
+            nn.Linear(4 * inB, inB),
+        )
+
+    def forward(self, H, W, F_fixed):
+        """
+        H: (B,K,N) cplx, W: (B,N,K) cplx
+        F_fixed/G_fixed are not used directly in this minimalist block (can be concatenated as extra tokens if desired).
+        Return: W_new: (B,N,K) cplx
+        """
+        B, K, N = H.shape
+        # Build tokens
+        # user-view rows (K): concat H_row and (W^H)_row  -> (B,2K,N) real/imag stacked
+        H_user = th.cat([H.real, H.imag], dim=1)               # (B,2K,N)
+        W_user = th.cat([W.real.transpose(1, 2), W.imag.transpose(1, 2)], dim=1)  # (B,2K,N)
+        XA = th.cat([H_user, W_user], dim=1)  # (B,4K,N)  ; but our A expects LA=2K tokens of dim 2N
+        # # reshape tokens: stack Re/Im along feature dim instead of token dim
+        # XA = th.cat([H.real, th.conj(W).transpose(1, 2).real], dim=1)  # (B,K+K,N) -> (B,2K,N)
+        # XA_im = th.cat([H.imag, th.conj(W).transpose(1, 2).imag], dim=1)  # (B,2K,N)
+        # XA = th.cat([XA, XA_im], dim=-1)  # (B,2K,2N) = LA × inA
+
+        # antenna-view columns (N): concat H^T_col and W_col
+        H_ant = th.cat([H.real.transpose(1, 2), H.imag.transpose(1, 2)], dim=1)  # (B,2N,K)
+        W_ant = th.cat([W.real, W.imag], dim=1)                                  # (B,2N,K)
+        XB = th.cat([H_ant, W_ant], dim=1)  # (B,4N,K)
+
+        y_h_mlp, y_w_mlp = self.mha_comm(XA, XB)  # (B,2K,N), (B,2K,N)
+        y_h_next = self.mlp_h(self.ln_h(y_h_mlp)) + y_h_mlp  # residual FF for H features
+        y_w_out = self.mlp_w(self.ln_w(y_w_mlp)) + y_w_mlp  # residual FF for W features
+
+        y_w_flat = y_w_out.reshape(y_w_out.shape[0], -1)  # flatten W-stream output to (B, beam_dim)
+        norm = th.norm(y_w_flat, dim=1, keepdim=True)  # normalize W-stream output
+        y_w_flat = y_w_flat / norm #( B, beam_dim)
+        y_w_next = y_w_flat.reshape(y_w_out.shape[0], 2*self.K, -1)  # reshape to (B, 2K, token_dim)
+
+        return y_h_next, y_w_next
+
+
+class SenseBlock(nn.Module):
+    """
+    Sensing L2O block: updates F given (G, F_prev) and (fixed) W as side info.
+    We'll use a similar dual-stream encode on (G,F).
+    """
+    def __init__(self, N, d_model=512, embed_dim=128, num_heads=8, dropout=0.0):
+        super().__init__()
+        self.N = N
+        inA = N  # per-token dim (real/imag of row)
+        inB = N
+        LA = 4 * N   # [G_row, F_row]
+        LB = 4 * N   # [G_col, F_col]
+        self.mha_sense = DualStreamMHA(inA, inB, LA, LB, d_model, embed_dim, num_heads, dropout)
+        self.ln_g = nn.LayerNorm(inA)
+        self.ln_f = nn.LayerNorm(inB)
+        self.mlp_g = nn.Sequential(
+            nn.Linear(inA, 4 * inA),
+            nn.GELU(),
+            nn.Linear(4 * inA, 4 * inA),
+            nn.GELU(),
+            nn.Linear(4 * inA, inA),
+            nn.LayerNorm(inA),
+        )
+        self.mlp_f = nn.Sequential(
+            nn.Linear(inB, 4 * inB),
+            nn.GELU(),
+            nn.Linear(4 * inB, 4 * inB),
+            nn.GELU(),
+            nn.Linear(4 * inB, inB),
+        )
+
+    def forward(self, G, F, W_fixed):
+        """
+        G: (B,N,N) cplx (kept constant in this task), F_prev: (B,N,N) cplx
+        Return: F_new: (B,N,N) cplx (||F||_F = 1)
+        """
+        B, N, _ = G.shape
+        G_user = th.cat([G.real, G.imag], dim=1)               # (B,2K,N)
+        F_user = th.cat([F.real.transpose(1, 2), F.imag.transpose(1, 2)], dim=1)  # (B,2K,N)
+        XA = th.cat([G_user, F_user], dim=1)  # (B,4K,N)  ; but our A expects LA=2K tokens of dim 2N
+        # # reshape tokens: stack Re/Im along feature dim instead of token dim
+        # XA = th.cat([H.real, th.conj(W).transpose(1, 2).real], dim=1)  # (B,K+K,N) -> (B,2K,N)
+        # XA_im = th.cat([H.imag, th.conj(W).transpose(1, 2).imag], dim=1)  # (B,2K,N)
+        # XA = th.cat([XA, XA_im], dim=-1)  # (B,2K,2N) = LA × inA
+
+        # antenna-view columns (N): concat G^T_col and F_col
+        G_ant = th.cat([G.real.transpose(1, 2), G.imag.transpose(1, 2)], dim=1)  # (B,2N,K)
+        F_ant = th.cat([F.real, F.imag], dim=1)                                  # (B,2N,K)
+        XB = th.cat([G_ant, F_ant], dim=1)  # (B,4N,K)
+
+        y_g_mlp, y_f_mlp = self.mha_sense(XA, XB)  # (B,2K,N), (B,2K,N)
+        y_g_next = self.mlp_g(self.ln_g(y_g_mlp)) + y_g_mlp  # residual FF for G features
+        y_f_out = self.mlp_f(self.ln_f(y_f_mlp)) + y_f_mlp  # residual FF for F features
+
+        y_f_flat = y_f_out.reshape(y_f_out.shape[0], -1)  # flatten F-stream output to (B, beam_dim)
+        norm = th.norm(y_f_flat, dim=1, keepdim=True)  # normalize F-stream output
+        y_f_flat = y_f_flat / norm #( B, beam_dim)
+        y_f_next = y_f_flat.reshape(y_f_out.shape[0], 2*self.N, -1)  # reshape to (B, 2N, token_dim)
+
+        return y_g_next, y_f_next ## ( B, 2K, N ), ( B, 2N, N )
+
+
+# -----------------------------
+# Alternating L2O ISAC model
+# -----------------------------
+class AlternatingISAC(nn.Module):
+    """
+    Stack L alternating blocks:
+      W_1 = CN_1(H, W_0 | F_0, G)
+      F_1 = SN_1(G, F_0 | W_1)
+      ...
+    Output (W_T, F_T)
+    """
+    def __init__(self, K=32, N=32, L=7, d_model=512, embed_dim=128, n_head=8, dropout=0.0):
+        super().__init__()
+        self.K, self.N, self.L = K, N, L
+        ## communication and sensing blocks
+        self.cn_blocks = nn.ModuleList([CommBlock(K, N, d_model, embed_dim, n_head, dropout) for _ in range(L)])
+        self.sn_blocks = nn.ModuleList([SenseBlock(N, d_model, embed_dim, n_head, dropout) for _ in range(L)])
+
+    def forward(self, H0, G0, W0, F0):
+        """
+        H: (B,K,N), G: (B,N,N), W0: (B,N,K), F0: (B,N,N); all complex
+        """
+        B = H0.shape[0]
+        H_update, G_update = H0, G0
+        W_update, F_update = W0, F0
+        for l in range(self.L):
+            y_h_next, y_w_next = self.cn_blocks[l](H_update, W_update, F_fixed=F_update)
+            W_update = y_w_next[:, :self.K, :] + 1j * y_w_next[:, self.K:, :]  # (B,N,K)
+            H_update = y_h_next[:, :self.K, :] + 1j * y_h_next[:, self.K:, :]  # (B,K,N)
+            y_g_next, y_f_next = self.sn_blocks[l](G_update, F_update, W_fixed=W_update)
+            F_update = y_f_next[:, :self.N, :] + 1j * y_f_next[:, self.N:, :]  # (B,N,N)
+            G_update = y_g_next[:, :self.N, :] + 1j * y_g_next[:, self.N:, :]  # (B,N,N)
+        return W_update, F_update ## (B,N,K), (B,N,N), final beamformers
+
+
+def custom_lr_scheduler(optimizer, config):
+    initial_lr = config.learning_rate
+    mid_lr = initial_lr * 0.5 ### very intricate here
+    final_lr = initial_lr * 0.3
+
+    def lr_lambda(epoch):
+        if epoch < config.mmse_epoch:
+            # Phase 1: Linear decay from initial_lr to mid_lr during supervised learning
+            current_lr = initial_lr - epoch * ((initial_lr - mid_lr) / config.mmse_epoch)
+            return current_lr / optimizer.param_groups[0]['initial_lr']
+        else:
+            # Phase 2: Cosine decay from mid_lr to final_lr during unsupervised learning
+            progress = float(epoch - config.mmse_epoch) / float(max(1, config.max_epoch - config.mmse_epoch))
+            cosine_factor = 0.5 * (1.0 + math.cos(math.pi * progress))  # 1→0
+            current_lr = mid_lr * cosine_factor + final_lr * (1 - cosine_factor)
+            return current_lr / optimizer.param_groups[0]['initial_lr']
+
+    # Store the initial learning rate in the optimizer
+    for param_group in optimizer.param_groups:
+        param_group['initial_lr'] = initial_lr
+        
+    return th.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
+
+# -----------------------------
+# Training & evaluation
+# -----------------------------
+class TrainConfig:
+    def __init__(self):
+        # Problem sizes
+        self.K = 32
+        self.N = 32
+        self.M_total = 10
+
+        # SNR / noise
+        self.comm_sigma2 = 1.0
+        self.sense_sigma2 = 0.01
+        self.train_SNR_dB = 15.0
+        self.SNR_lin = 10.0 ** (self.train_SNR_dB / 10.0)
+        self.eta_dB = 5.0 ## sensing SNR target in dB
+
+        # Model & optimization
+        self.L = 10
+        self.d_model = 512
+        self.embed_dim = 128
+        self.n_head = 8
+        self.dropout = 0.0
+        self.lr = 2e-4
+        self.weight_decay = 0.0
+        self.max_epoch = 600
+        self.mmse_epoch = 100
+        self.batch_size = 64
+        self.test_batch = 128
+        self.train_steps_per_epoch = 700  # like pbar_size
+        self.test_steps = 200
+        self.learning_rate = 2e-4
+
+        # Sliding successive training over alternating depth
+        self.milestones = [i * 20 for i in range(1, 11)]  # for L=10
+
+        # PGD (optional) – here we keep blocks purely feedforward for clarity
+        self.use_pgd = True
+        self.pgd_steps_comm = 5
+        self.pgd_steps_sense = 5
+        self.pre_pgd_steps = 10
+        self.pgd_step_size_comm = 2.25e-2
+        self.pgd_step_size_sense = 8e-2
+        self.pre_pgd_step_size = 2.25e-2
+
+
+def train_isac(config: TrainConfig):
+
+    ## model initialization
+    model = AlternatingISAC(K=config.K, N=config.N, L=config.L,
+                            d_model=config.d_model, embed_dim=config.embed_dim, n_head=config.n_head, dropout=config.dropout).to(device)
+
+    # opt = optim.AdamW(model.parameters(), lr=config.lr, weight_decay=config.weight_decay)
+
+    # Datasets
+    train_ds = ISACDataset(config.batch_size * config.train_steps_per_epoch,
+                           K=config.K, N=config.N, M_total=config.M_total, SNR_lin=config.SNR_lin)
+
+    train_loader = DataLoader(train_ds, batch_size=config.batch_size, shuffle=True, drop_last=True)
+
+    for epoch in range(config.max_epoch):
+        # successive (freeze deeper pairs)
+        suc_state = min(bisect_right(config.milestones, epoch), config.L - 1)
+        for i, (cn, sn) in enumerate(zip(model.cn_blocks, model.sn_blocks)):
+            if i == suc_state: ## only train the current block, including communication and sensing blocks
+                cn.train(); sn.train()
+                for p in cn.parameters(): p.requires_grad = True
+                for p in sn.parameters(): p.requires_grad = True
+            else:
+                cn.eval(); sn.eval()
+                for p in cn.parameters(): p.requires_grad = False
+                for p in sn.parameters(): p.requires_grad = False
+            # requires = (i <= suc_state)
+            # cn.train(requires); sn.train(requires)
+            # for p in cn.parameters(): p.requires_grad = requires
+            # for p in sn.parameters(): p.requires_grad = requires
+
+        # opt = optim.AdamW([p for p in model.parameters() if p.requires_grad],
+        #                   lr=config.lr, weight_decay=config.weight_decay)
+
+        opt_cn = optim.AdamW([p for i, cn in enumerate(model.cn_blocks) for p in cn.parameters() if i == suc_state],
+                          lr=config.lr, weight_decay=config.weight_decay)
+        
+        opt_sn = optim.AdamW([p for i, sn in enumerate(model.sn_blocks) for p in sn.parameters() if i == suc_state],
+                          lr=config.lr, weight_decay=config.weight_decay)
+
+        scheduler_cn = custom_lr_scheduler(opt_cn, config)
+        scheduler_cn.step(epoch)
+
+        scheduler_sn = custom_lr_scheduler(opt_sn, config)
+        scheduler_sn.step(epoch)
+
+        pbar = tqdm(train_loader, total=config.train_steps_per_epoch, desc=f"Epoch {epoch+1}")
+        iters = 0
+        epoch_comm = 0.0
+        epoch_sense = 0.0
+        epoch_sumrate = 0.0
+        pbar_batches = 0
+
+        for batch in pbar:
+            if iters >= config.train_steps_per_epoch:
+                break
+            iters += 1
+
+            # Expand to batch_size dimension present in DataLoader (here actually already batched)
+            H = to_complex(batch["H_real"], batch["H_imag"]).to(th.complex64) # (B,K,N)
+            Hm = to_complex(batch["Hm_real"], batch["Hm_imag"]).to(th.complex64) # (B,M,N,N)
+            G = to_complex(batch["G_real"], batch["G_imag"]).to(th.complex64) # (B,N,N)
+            mask = batch["active_mask"].to(device, dtype = th.float32) # (B,M)
+
+            B = H.shape[0]; K = config.K; N = config.N
+
+            # Initializers: W0 from MMSE, F0 from null-space
+            W0 = compute_mmse_beamformer(H, K=K, N=N, total_power=1.0, noise_power=config.comm_sigma2) # (B,N,K)
+            F0 = init_F_in_nullspace(H, N=N) # (B,N,N)
+
+            ### if adopt PGD update for the initial beamformer
+            W_prev_pre = W0.clone().requires_grad_(True)  # (B, N, K)
+            for _ in range(config.pre_pgd_steps):
+                loss_inner = sum_rate_with_sensing_interf(H, W_prev_pre, F0, noise_pow=config.comm_sigma2)
+                grad_w = th.autograd.grad(loss_inner, W_prev_pre, create_graph=True)[0]  ## maintain second-order gradient
+                W_prev_pre = proj_fro_unit(W_prev_pre + config.pre_pgd_step_size * grad_w)  # (B, N, K)
+            W0 = W_prev_pre.to(device) # (B, N, K)
+
+            # sum_rate_mmse = sum_rate(H_mat, W0, sigma2=1.0).mean().item()
+            # sum_rate_mmse = sum_rate_with_sensing_interf(H, W0, F0, noise_pow=config.comm_sigma2).item()
+            # mmse_rate_printed = False
+            # if not mmse_rate_printed:
+            #     print(f"MMSE sum rate: {sum_rate_mmse:.4f}")
+            #     mmse_rate_printed = True
+            #     bp()
+
+            # vec_w0 = th.cat((th.real(W0).reshape(-1, config.N * config.K), th.imag(W0).reshape(-1, config.N * config.K)), dim=-1).reshape(-1, 2 * config.N * config.K)
+            # norm_W0 = th.norm(vec_w0, dim=1, keepdim=True)
+            # normlized_W0 = vec_w0 / norm_W0
+            # W_mat_0 = (normlized_W0[:, :config.N * config.K].reshape(-1, config.N, config.K) + 1j * normlized_W0[:, config.N * config.K:].reshape(-1, config.N, config.K))
+            # W_prev = W_mat_0.transpose(-1, -2).to(device) 
+
+            total_rate = 0
+            rate_record_per_batch = []
+
+            total_sense_loss = 0
+            sense_loss_record_per_batch = []
+
+            H_update, G_update = H, G
+            W_update, F_update = W0, F0
+
+            W_traj, F_traj = [], []
+            for l in range(suc_state + 1):
+
+                ## Communication block
+
+                F_pre_update = F_update
+                y_h_next, y_w_next = model.cn_blocks[l](H_update, W_update, F_fixed=F_update)
+                W_update = y_w_next[:, :config.K, :] + 1j * y_w_next[:, config.K:, :]  # (B,N,K)
+                H_update = y_h_next[:, :config.K, :] + 1j * y_h_next[:, config.K:, :]  # (B,K,N)
+
+                W_pre_pgd = W_update.clone().requires_grad_(True)
+                for _ in range(config.pgd_steps_comm):
+                    sr_inner = sum_rate_with_sensing_interf(H, W_pre_pgd, F_update.detach(), noise_pow=config.comm_sigma2)
+                    (grad_w_inner,) = th.autograd.grad(sr_inner, W_pre_pgd, create_graph=True)
+                    W_pre_pgd = proj_fro_unit(W_pre_pgd + config.pgd_step_size_comm * grad_w_inner)
+                W_update = W_pre_pgd ## (B,N,K)
+
+                current_rate = sum_rate_with_sensing_interf(H, W_update, F_update.detach(), noise_pow=config.comm_sigma2).item()
+                total_rate += current_rate
+                rate_record_per_batch.append(current_rate)
+
+                 ## Sensing block
+
+                y_g_next, y_f_next = model.sn_blocks[l](G_update, F_update, W_fixed=W_update)
+                F_update = y_f_next[:, :config.N, :] + 1j * y_f_next[:, config.N:, :]  # (B,N,N)
+                G_update = y_g_next[:, :config.N, :] + 1j * y_g_next[:, config.N:, :]  # (B,N,N)
+
+                F_pre_pgd = F_update.clone().requires_grad_(True)
+                for _ in range(config.pgd_steps_sense):
+                    s_loss_inner = sensing_barrier_loss(Hm, W_update.detach(), F_pre_pgd, mask, eta_dB=config.eta_dB,
+                                                       sigma_z2=config.sense_sigma2) ## minimize it
+                    (grad_f_inner,) = th.autograd.grad(-s_loss_inner, F_pre_pgd, create_graph=True)
+                    F_pre_pgd = proj_fro_unit(F_pre_pgd + config.pgd_step_size_sense * grad_f_inner)
+                F_update = F_pre_pgd  ## (B,N,N)
+
+                current_sense_loss = sensing_barrier_loss(Hm, W_update.detach(), F_update, mask, eta_dB=config.eta_dB,
+                                                         sigma_z2=config.sense_sigma2).item()
+                total_sense_loss += current_sense_loss
+                sense_loss_record_per_batch.append(current_sense_loss)
+
+                W_traj.append(W_update)
+                F_traj.append(F_update)
+            
+            W_final = W_update
+            F_final = F_update
+            F_pre_final = F_pre_update
+
+            final_rate = sum_rate_with_sensing_interf(H, W_final, F_pre_final.detach(), noise_pow=config.comm_sigma2)
+            loss_comm = -final_rate - config.balance_sense * sensing_barrier_loss(Hm, W_final.detach(), F_final, mask,
+                                                                                  eta_dB=config.eta_dB, sigma_z2=config.sense_sigma2)
+            opt_cn.zero_grad()
+            loss_comm.backward()
+            th.nn.utils.clip_grad_norm_([p for i, cn in enumerate(model.cn_blocks) for p in cn.parameters() if i == suc_state], max_norm=200.0)
+            opt_cn.step()
+
+            final_sense_loss = sensing_barrier_loss(Hm, W_final.detach(), F_final, mask, eta_dB=config.eta_dB, sigma_z2=config.sense_sigma2)
+            opt_sn.zero_grad()
+            final_sense_loss.backward()
+            th.nn.utils.clip_grad_norm_([p for i, sn in enumerate(model.sn_blocks) for p in sn.parameters() if i == suc_state], max_norm=200.0)
+            opt_sn.step()
+
+            ave_rate = total_rate / float(suc_state + 1)
+            epoch_comm += ave_rate
+            ave_sense_loss = total_sense_loss / float(suc_state + 1)
+            epoch_sense += ave_sense_loss
+            pbar_batches += 1
+
+
+            formatted_rate = [f"{r:.3f}" for r in rate_record_per_batch]
+            formatted_sense_loss = [f"{s:.3f}" for s in sense_loss_record_per_batch]
+            pbar.set_description(f"Epoch {epoch+1} | Rate: {formatted_rate} | Sense: {formatted_sense_loss}")
+
+        ave_pbar_rate = epoch_comm / float(pbar_batches)
+        ave_pbar_sense = epoch_sense / float(pbar_batches)
+        current_lr = scheduler_cn.get_last_lr()[0]
+        print(f"Epoch {epoch+1}. Avg Rate: {ave_pbar_rate:.4f}, Avg Sense Loss: {ave_pbar_sense:.4f}, LR: {current_lr:.6e}")
+
+
+# test_ds = ISACDataset(config.test_batch * config.test_steps,
+#                         K=config.K, N=config.N, M_total=config.M_total, SNR_lin=config.SNR_lin)
+
+# test_loader = DataLoader(test_ds, batch_size=config.test_batch, shuffle=False)
+
+def evaluate_isac(model: AlternatingISAC, test_loader: DataLoader, config: TrainConfig) -> float:
+    model.eval()
+    ave_sumrate = 0.0
+    with th.no_grad():
+        pbar = tqdm(test_loader, total=config.test_steps, desc="Testing")
+        iters = 0
+        for batch in pbar:
+            if iters >= config.test_steps:
+                break
+            iters += 1
+            H = to_complex(batch["H_real"], batch["H_imag"]).to(th.complex64)
+            Hm = to_complex(batch["Hm_real"], batch["Hm_imag"]).to(th.complex64)
+            G = to_complex(batch["G_real"], batch["G_imag"]).to(th.complex64)
+            # mask = batch["active_mask"]  # not needed for sum-rate
+            K, N = config.K, config.N
+
+            W0 = compute_mmse_beamformer(H, K=K, N=N, total_power=1.0, noise_power=config.comm_sigma2)
+            F0 = init_F_in_nullspace(H, N=N)
+            W_pred, F_pred = model(H, G, W0, F0)
+
+            sr = sum_rate_with_sensing_interf(H, W_pred, F_pred, noise_pow=config.comm_sigma2)
+            ave_sumrate += sr.item()
+            pbar.set_postfix(rate=f"{sr.item():.4f}")
+
+    ave_sumrate /= float(iters)
+    print(f"[Test] Average Sum-Rate: {ave_sumrate:.4f}")
+    return ave_sumrate
+
+
+# -----------------------------
+# Main
+# -----------------------------
+if __name__ == "__main__":
+    cfg = TrainConfig()
+    train_isac(cfg)
