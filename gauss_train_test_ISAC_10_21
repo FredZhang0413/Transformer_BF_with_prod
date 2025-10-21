@@ -640,7 +640,7 @@ class TrainConfig:
         self.learning_rate = 2e-4
 
         # Sliding successive training over alternating depth
-        self.milestones = [i * 10 for i in range(1, 11)]  # for L=10
+        self.milestones = [i * 20 for i in range(1, 8)]  # for L=7
 
         # PGD (optional) – here we keep blocks purely feedforward for clarity
         self.use_pgd = True
